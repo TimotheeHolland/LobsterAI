@@ -7,7 +7,7 @@
 
 import { DeliveryMode as ScheduledTaskDeliveryMode } from '../../scheduledTask/constants';
 import type { ScheduledTaskJobDelivery } from '../../scheduledTask/cronJobService';
-import { parseImConversationId, PlatformRegistry } from '../../shared/platform';
+import { ImPeerKind, parseImConversationId, PlatformRegistry } from '../../shared/platform';
 import type { CoworkSession, CoworkStore } from '../coworkStore';
 import { t } from '../i18n';
 import type { IMStore } from '../im/imStore';
@@ -15,7 +15,17 @@ import type { Platform } from '../im/types';
 
 const LOBSTERAI_SESSION_PREFIX = 'lobsterai:';
 const FEISHU_GROUP_CHAT_ID_RE = /^oc_/i;
+const WEIXIN_PLATFORM: Platform = 'weixin';
 export const DEFAULT_MANAGED_AGENT_ID = 'main';
+
+function isInvalidWeixinNonDirectConversation(parsed: {
+  platform: Platform;
+  conversationId: string;
+}): boolean {
+  if (parsed.platform !== WEIXIN_PLATFORM) return false;
+  const peerKind = parseImConversationId(parsed.conversationId).peerKind;
+  return peerKind !== undefined && peerKind !== ImPeerKind.Direct;
+}
 
 export interface ManagedSessionKey {
   agentId: string | null;
@@ -502,6 +512,16 @@ export class OpenClawChannelSessionSync {
       parsed.conversationId,
     );
 
+    // The Weixin plugin only supports direct messages. Older OpenClaw target
+    // resolution could incorrectly emit an account-less `group:<peer>` key for
+    // an outbound send. Never materialize that invalid alias as a second local
+    // conversation; the canonical account-scoped direct key remains authoritative.
+    if (isInvalidWeixinNonDirectConversation(parsed)) {
+      console.warn('[ChannelSessionSync] ignored invalid non-direct Weixin session key:', sessionKey);
+      this.rejectedKeys.add(sessionKey);
+      return null;
+    }
+
     const agentId = this.resolveAgentIdForSessionKey(sessionKey, parsed.platform);
 
     // 4. Check persistent mapping in im_session_mappings
@@ -633,6 +653,10 @@ export class OpenClawChannelSessionSync {
       this.rejectedKeys.add(sessionKey);
       return null;
     }
+    if (isInvalidWeixinNonDirectConversation(parsed)) {
+      this.rejectedKeys.add(sessionKey);
+      return null;
+    }
 
     const agentId = this.resolveAgentIdForSessionKey(sessionKey, parsed.platform);
 
@@ -704,6 +728,13 @@ export class OpenClawChannelSessionSync {
     for (const mapping of this.imStore.listSessionMappings(platform)) {
       const parsed = parseImConversationId(mapping.imConversationId);
       if (parsed.peerId.trim().toLowerCase() !== peer) continue;
+      if (
+        platform === WEIXIN_PLATFORM
+        && parsed.peerKind
+        && parsed.peerKind !== ImPeerKind.Direct
+      ) {
+        continue;
+      }
       if (accountId && parsed.accountId && parsed.accountId !== accountId) continue;
       const sessionKey = mapping.openClawSessionKey?.trim();
       if (!sessionKey) continue;

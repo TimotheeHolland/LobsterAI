@@ -24,6 +24,36 @@ function patchWeixinGatewayMethods(channelPath, label, log) {
   }
 }
 
+function patchWeixinDirectTargetType(channelPath, label, log) {
+  if (!fs.existsSync(channelPath)) {
+    return;
+  }
+
+  let src = fs.readFileSync(channelPath, 'utf8');
+  const directTargetPatchMarker = 'weixin_direct_target_type_patch';
+  if (src.includes(directTargetPatchMarker)) {
+    log(`${label} direct target type patch already applied, skipping`);
+    return;
+  }
+  if (/\binferTargetChatType\s*:/.test(src)) {
+    log(`${label} already declares target type inference, skipping direct target type patch`);
+    return;
+  }
+
+  const messagingTargetResolver = /(\bmessaging:\s*\{\s*\n)(\s*)(targetResolver:\s*\{)/;
+  if (!messagingTargetResolver.test(src)) {
+    log(`${label} messaging target resolver not found, skipping direct target type patch`);
+    return;
+  }
+
+  src = src.replace(
+    messagingTargetResolver,
+    `$1$2inferTargetChatType: () => "direct", // ${directTargetPatchMarker}\n$2$3`,
+  );
+  fs.writeFileSync(channelPath, src);
+  log(`Patched ${label}: outbound targets are explicitly classified as direct messages`);
+}
+
 function patchWeixinStartupActivation(weixinManifestPath, log) {
   if (!fs.existsSync(weixinManifestPath)) {
     return;
@@ -116,6 +146,16 @@ function patchWeixin({ runtimeExtensionsDir, log }) {
     log
   );
   patchWeixinGatewayMethods(
+    path.join(runtimeExtensionsDir, 'openclaw-weixin', 'dist', 'src', 'channel.js'),
+    'openclaw-weixin/dist/src/channel.js',
+    log
+  );
+  patchWeixinDirectTargetType(
+    path.join(runtimeExtensionsDir, 'openclaw-weixin', 'src', 'channel.ts'),
+    'openclaw-weixin/src/channel.ts',
+    log
+  );
+  patchWeixinDirectTargetType(
     path.join(runtimeExtensionsDir, 'openclaw-weixin', 'dist', 'src', 'channel.js'),
     'openclaw-weixin/dist/src/channel.js',
     log

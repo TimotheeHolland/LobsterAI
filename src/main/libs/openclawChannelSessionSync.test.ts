@@ -222,6 +222,89 @@ test('channel sync resolves the conversation record for a delivery target', () =
   expect(sync.resolveConversationByDeliveryTarget('not-a-channel', 'ou_c167')).toBe(null);
 });
 
+test('channel sync ignores invalid Weixin group aliases from outbound delivery', () => {
+  const createSession = vi.fn();
+  const getSessionMapping = vi.fn(() => ({
+    imConversationId: 'group:wxid_zhangsan@im.wechat',
+    platform: 'weixin',
+    coworkSessionId: 'invalid-weixin-group',
+    agentId: 'main',
+    openClawSessionKey: 'agent:main:openclaw-weixin:group:wxid_zhangsan@im.wechat',
+    createdAt: 1,
+    lastActiveAt: 2,
+  }));
+  const sync = new OpenClawChannelSessionSync({
+    coworkStore: {
+      getSession: () => ({ id: 'invalid-weixin-group' }),
+      createSession,
+    },
+    imStore: {
+      getSessionMapping,
+      updateSessionLastActive: () => {},
+      deleteSessionMapping: () => {},
+      createSessionMapping: () => {},
+    },
+    getDefaultCwd: () => '/tmp',
+  });
+  const invalidGroupKey = 'agent:main:openclaw-weixin:group:wxid_zhangsan@im.wechat';
+
+  expect(sync.resolveOrCreateSession(invalidGroupKey)).toBe(null);
+  expect(sync.resolveSession(invalidGroupKey)).toBe(null);
+  expect(createSession).not.toHaveBeenCalled();
+  expect(getSessionMapping).not.toHaveBeenCalled();
+});
+
+test('channel sync never selects an invalid Weixin group mapping for delivery mirrors', () => {
+  const mappings = [
+    {
+      imConversationId: 'group:wxid_zhangsan@im.wechat',
+      platform: 'weixin',
+      coworkSessionId: 'invalid-weixin-group',
+      agentId: 'main',
+      openClawSessionKey: 'agent:main:openclaw-weixin:group:wxid_zhangsan@im.wechat',
+      createdAt: 1,
+      lastActiveAt: 3,
+    },
+    {
+      imConversationId: 'weixin-bot-1:direct:wxid_zhangsan@im.wechat',
+      platform: 'weixin',
+      coworkSessionId: 'weixin-direct',
+      agentId: 'main',
+      openClawSessionKey:
+        'agent:main:openclaw-weixin:weixin-bot-1:direct:wxid_zhangsan@im.wechat',
+      createdAt: 1,
+      lastActiveAt: 2,
+    },
+  ];
+  const sync = new OpenClawChannelSessionSync({
+    coworkStore: {
+      getSession: (id: string) => ({ id }),
+      createSession: () => {
+        throw new Error('createSession should not be called in this test');
+      },
+    },
+    imStore: {
+      getSessionMapping: () => null,
+      updateSessionLastActive: () => {},
+      deleteSessionMapping: () => {},
+      createSessionMapping: () => {},
+      listSessionMappings: () => mappings,
+    },
+    getDefaultCwd: () => '/tmp',
+  });
+
+  expect(
+    sync.resolveConversationByDeliveryTarget(
+      'openclaw-weixin',
+      'WxId_ZhangSan@im.wechat',
+    ),
+  ).toEqual({
+    sessionId: 'weixin-direct',
+    sessionKey:
+      'agent:main:openclaw-weixin:weixin-bot-1:direct:wxid_zhangsan@im.wechat',
+  });
+});
+
 test('channel sync resolves account-less group delivery target by selected bot binding', () => {
   const knownSessions = new Set(['feishu-main-group', 'feishu-bound-group']);
   const mappings = [
