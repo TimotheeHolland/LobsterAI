@@ -10,6 +10,9 @@ const unpackScript = repoFile('scripts/unpack-cfmind.cjs');
 const installSection = repoFile(
   'node_modules/app-builder-lib/templates/nsis/installSection.nsh',
 );
+const assistedInstaller = repoFile(
+  'node_modules/app-builder-lib/templates/nsis/assistedInstaller.nsh',
+);
 const extractTemplate = repoFile(
   'node_modules/app-builder-lib/templates/nsis/include/extractAppPackage.nsh',
 );
@@ -24,7 +27,11 @@ const webPackageTemplate = repoFile(
 );
 const appBuilderPatch = repoFile('patches/app-builder-lib+24.13.3.patch');
 const electronBuilderConfig = JSON.parse(repoFile('electron-builder.json')) as {
-  nsis?: { deleteAppDataOnUninstall?: boolean };
+  nsis?: {
+    deleteAppDataOnUninstall?: boolean;
+    oneClick?: boolean;
+    runAfterFinish?: boolean;
+  };
 };
 
 const classifyFreshTarget = ({
@@ -50,6 +57,22 @@ const classifyFreshTarget = ({
 };
 
 describe('Windows installer hardening contracts', () => {
+  test('keeps assisted installs visible without forcing UI in silent mode', () => {
+    expect(electronBuilderConfig.nsis?.oneClick).toBe(false);
+    expect(electronBuilderConfig.nsis?.runAfterFinish).toBe(true);
+    expect(assistedInstaller).toContain('!insertmacro MUI_PAGE_INSTFILES');
+
+    // Standard /S installs suppress the assisted pages. Do not create a
+    // plugin-owned window that bypasses NSIS silent mode.
+    expect(installerInclude).not.toContain('Banner::');
+
+    // Silent software-store installs can still opt into the existing
+    // post-install launch path with /S --force-run.
+    expect(installSection).toContain('${if} ${isForceRun}');
+    expect(installSection).toContain('${if} ${Silent}');
+    expect(installSection).toContain('!insertmacro doStartApp');
+  });
+
   test('releases the installer current-directory lock before the update rename', () => {
     const switchOutPath = installerInclude.indexOf('SetOutPath "$PLUGINSDIR"');
     const rename = installerInclude.indexOf(
