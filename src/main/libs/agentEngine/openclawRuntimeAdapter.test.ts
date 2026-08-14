@@ -28,6 +28,7 @@ import {
   COWORK_BTW_RESULT_MAX_CHARS,
   CoworkBtwStatus,
 } from '../../../shared/cowork/btw';
+import { OpenClawCronRunMetadataKey } from '../../../shared/cowork/openclawCronSessionKey';
 import { CoworkSelectedTextSource } from '../../../shared/cowork/selectedText';
 import { OpenClawTranscriptSafetyLimit } from '../../../shared/openclawTranscript/constants';
 import { t } from '../../i18n';
@@ -50,6 +51,7 @@ import {
   OPENCLAW_CHAT_SEND_PAYLOAD_SAFE_LIMIT_BYTES,
   OpenClawRuntimeAdapter,
   pickPersistedAssistantSegment,
+  PLAN_MODE_RECOVERY_USAGE_CONTINUATION_PROMPT,
   resolveOpenClawRuntimeErrorMessage,
   resolveOpenClawToolLoopErrorOverride,
   resolveToolEventIsError,
@@ -201,6 +203,28 @@ test('plan mode assistant snapshot jitter keeps one visible plan message', () =>
   expect(assistantMessages).toHaveLength(1);
   expect(turn.assistantMessageId).toBe(firstMessageId);
   expect(turn.committedAssistantText).toBe('');
+});
+
+test('assistant agent stream uses the gateway event timestamp', () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+  const turn = createActiveTurn(session.id, sessionKey, 'run-with-timestamp');
+  adapter.activeTurns.set(session.id, turn);
+  adapter.sessionIdByRunId.set('run-with-timestamp', session.id);
+
+  adapter.processAgentAssistantText({
+    runId: 'run-with-timestamp',
+    sessionKey,
+    stream: 'assistant',
+    ts: 1_786_665_432_100,
+    data: { text: 'Timestamped answer' },
+  });
+
+  expect(session.messages.find(message => message.type === 'assistant')?.timestamp)
+    .toBe(1_786_665_432_100);
 });
 
 test('pickPersistedAssistantSegment: stream authority keeps previous when same length or longer', () => {
@@ -1734,7 +1758,85 @@ test('context usage coalesces concurrent refreshes for the same session', async 
 test('usage metadata falls back to latest assistant when preferred id was replaced', async () => {
   const { session, store } = createReconcileStore([
     { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
-    { id: 'msg-2', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Done',
+      timestamp: 2,
+      metadata: { skillIds: ['existing-skill'], customFlag: true },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+  (adapter as unknown as {
+    contextWindowCache: Map<string, number>;
+    contextWindowCacheLoaded: boolean;
+  }).contextWindowCache.set('qwen-portal/qwen3.6-plus', 1_000_000);
+  (adapter as unknown as { contextWindowCacheLoaded: boolean }).contextWindowCacheLoaded = true;
+
+  await (adapter as unknown as {
+    applyUsageMetadataFromFinal: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      usage: {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        promptTokens?: number;
+      } | undefined,
+      model: string | undefined,
+    ) => Promise<void>;
+  }).applyUsageMetadataFromFinal(
+    session.id,
+    sessionKey,
+    'stale-message-id',
+    {
+      input: 1,
+      output: 391,
+      cacheRead: 438_400,
+      cacheWrite: 307,
+      promptTokens: 438_708,
+    },
+    'qwen-portal/qwen3.6-plus',
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: {
+      inputTokens: 1,
+      outputTokens: 391,
+      cacheReadTokens: 438_400,
+      cacheWriteTokens: 307,
+    },
+    contextPercent: 44,
+    model: 'qwen-portal/qwen3.6-plus',
+    agentName: 'main',
+    skillIds: ['existing-skill'],
+    customFlag: true,
+  });
+});
+
+test('direct final usage does not downgrade an authoritative turn aggregate', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Done',
+      timestamp: 2,
+      metadata: {
+        customFlag: true,
+        usage: {
+          inputTokens: 45_000,
+          outputTokens: 300,
+          cacheReadTokens: 35_000,
+          cacheWriteTokens: 600,
+        },
+        contextPercent: 51,
+        model: 'anthropic/claude-sonnet-4',
+      },
+    },
   ]);
   const adapter = new OpenClawRuntimeAdapter(store, {});
 
@@ -1743,29 +1845,72 @@ test('usage metadata falls back to latest assistant when preferred id was replac
       sessionId: string,
       sessionKey: string,
       assistantMessageId: string,
-      inputTokens: number | undefined,
-      outputTokens: number | undefined,
+      usage: {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+      } | undefined,
       model: string | undefined,
-      totalTokens?: number | undefined,
-      cacheReadTokens?: number | undefined,
     ) => Promise<void>;
   }).applyUsageMetadataFromFinal(
     session.id,
     `agent:main:lobsterai:${session.id}`,
-    'stale-message-id',
-    80_262,
-    391,
-    'qwen-portal/qwen3.6-plus',
+    'msg-2',
+    { input: 25_000, output: 200, cacheRead: 5_000, cacheWrite: 100 },
+    'different/single-call-model',
   );
 
   expect(session.messages[1].metadata).toMatchObject({
+    customFlag: true,
+    isStreaming: false,
+    isFinal: true,
     usage: {
-      inputTokens: 80_262,
-      outputTokens: 391,
+      inputTokens: 45_000,
+      outputTokens: 300,
+      cacheReadTokens: 35_000,
+      cacheWriteTokens: 600,
     },
-    model: 'qwen-portal/qwen3.6-plus',
-    agentName: 'main',
+    contextPercent: 51,
+    model: 'anthropic/claude-sonnet-4',
   });
+});
+
+test('direct final usage does not borrow a cached window from a switched provider', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+  adapter.contextWindowCache.set('provider-a/shared-model', 100_000);
+  adapter.contextWindowCacheLoaded = true;
+  adapter.sessionContextTokensCache.set(sessionKey, 40_000);
+
+  await (adapter as unknown as {
+    applyUsageMetadataFromFinal: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      usage: { input?: number; output?: number } | undefined,
+      model: string | undefined,
+      contextModelRef?: string,
+    ) => Promise<void>;
+  }).applyUsageMetadataFromFinal(
+    session.id,
+    sessionKey,
+    'msg-2',
+    { input: 20_000, output: 100 },
+    'shared-model',
+    'provider-a/shared-model',
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 20_000, outputTokens: 100 },
+    contextPercent: 20,
+    model: 'provider-a/shared-model',
+  });
+  expect(adapter.sessionContextTokensCache.get(sessionKey)).toBe(40_000);
 });
 
 test('resolveToolEventIsError reads nested tool result errors', () => {
@@ -1984,6 +2129,11 @@ test('patchSession sends model and thinking level atomically', async () => {
     isChannelSession: false,
     persistedSessionKey: null,
   });
+  const sessionKey = 'agent:main:lobsterai:session-1';
+  const contextCache = (adapter as unknown as {
+    sessionContextTokensCache: Map<string, number>;
+  }).sessionContextTokensCache;
+  contextCache.set(sessionKey, 1_000_000);
 
   const result = await adapter.patchSession('session-1', {
     model: 'lobsterai-server/deepseek-v4-flash',
@@ -2002,6 +2152,126 @@ test('patchSession sends model and thinking level atomically', async () => {
     modelOverride: 'lobsterai-server/deepseek-v4-flash',
     thinkingLevel: 'max',
   });
+  expect(contextCache.has(sessionKey)).toBe(false);
+});
+
+test('session context token cache is bounded and excludes one-shot cron run keys', () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  const internals = adapter as unknown as {
+    cacheSessionContextTokens: (sessionKey: string, contextTokens: number) => void;
+    sessionContextTokensCache: Map<string, number>;
+  };
+
+  for (let index = 0; index < 401; index += 1) {
+    internals.cacheSessionContextTokens(`agent:main:lobsterai:session-${index}`, 100_000 + index);
+  }
+  internals.cacheSessionContextTokens('agent:main:cron:job-1:run:run-1', 200_000);
+
+  expect(internals.sessionContextTokensCache.size).toBe(400);
+  expect(internals.sessionContextTokensCache.has('agent:main:lobsterai:session-0')).toBe(false);
+  expect(internals.sessionContextTokensCache.get('agent:main:lobsterai:session-400')).toBe(100_400);
+  expect(internals.sessionContextTokensCache.has('agent:main:cron:job-1:run:run-1')).toBe(false);
+});
+
+test('stale sessions.list responses cannot repopulate context cache after reconnect', async () => {
+  let resolveSessions: ((value: { sessions: unknown[] }) => void) | undefined;
+  const oldClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise<{ sessions: unknown[] }>((resolve) => {
+      resolveSessions = resolve;
+    })),
+  };
+  const newClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(async () => ({ sessions: [] })),
+  };
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  const internals = adapter as unknown as {
+    gatewayClient: typeof oldClient | typeof newClient;
+    gatewayClientGeneration: number;
+    refreshSessionContextTokens: (sessionKey: string) => Promise<number | undefined>;
+    sessionContextTokensCache: Map<string, number>;
+  };
+  internals.gatewayClient = oldClient;
+  internals.gatewayClientGeneration = 1;
+
+  const refresh = internals.refreshSessionContextTokens('agent:main:lobsterai:session-1');
+  await vi.waitFor(() => expect(oldClient.request).toHaveBeenCalledTimes(1));
+  internals.gatewayClientGeneration = 2;
+  internals.gatewayClient = newClient;
+  resolveSessions?.({
+    sessions: [{ key: 'agent:main:lobsterai:session-1', contextTokens: 100_000 }],
+  });
+
+  await expect(refresh).resolves.toBeUndefined();
+  expect(internals.sessionContextTokensCache.size).toBe(0);
+});
+
+test('session invalidation rejects an in-flight context response in the same gateway generation', async () => {
+  let resolveSessions: ((value: { sessions: unknown[] }) => void) | undefined;
+  const client = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise<{ sessions: unknown[] }>((resolve) => {
+      resolveSessions = resolve;
+    })),
+  };
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  const internals = adapter as unknown as {
+    gatewayClient: typeof client;
+    refreshSessionContextTokens: (sessionKey: string) => Promise<number | undefined>;
+    invalidateSessionContextTokens: (sessionKey: string) => void;
+    sessionContextTokensCache: Map<string, number>;
+  };
+  const sessionKey = 'agent:main:lobsterai:session-1';
+  internals.gatewayClient = client;
+
+  const refresh = internals.refreshSessionContextTokens(sessionKey);
+  await vi.waitFor(() => expect(client.request).toHaveBeenCalledTimes(1));
+  internals.invalidateSessionContextTokens(sessionKey);
+  resolveSessions?.({ sessions: [{ key: sessionKey, contextTokens: 100_000 }] });
+
+  await expect(refresh).resolves.toBeUndefined();
+  expect(internals.sessionContextTokensCache.has(sessionKey)).toBe(false);
+});
+
+test('usage metadata timers coalesce and stop with the gateway lifecycle', async () => {
+  vi.useFakeTimers();
+  try {
+    const request = vi.fn(async () => ({
+      messages: [{ role: 'assistant', content: 'Done', usage: { input: 10, output: 2 } }],
+    }));
+    const adapter = new OpenClawRuntimeAdapter({ getSession: () => null } as never, {});
+    adapter.gatewayClient = { start: () => {}, stop: () => {}, request };
+    const internals = adapter as unknown as {
+      scheduleUsageMetadataSync: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+        delayMs: number,
+        retryIndex: number,
+      ) => void;
+      usageMetadataSyncTimers: Map<string, ReturnType<typeof setTimeout>>;
+    };
+
+    internals.scheduleUsageMetadataSync('session-1', 'agent:main:lobsterai:session-1', 'msg-1', 100, 0);
+    internals.scheduleUsageMetadataSync('session-1', 'agent:main:lobsterai:session-1', 'msg-1', 100, 0);
+    expect(internals.usageMetadataSyncTimers.size).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(internals.usageMetadataSyncTimers.size).toBe(0);
+
+    internals.scheduleUsageMetadataSync('session-1', 'agent:main:lobsterai:session-1', 'msg-1', 100, 0);
+    adapter.stopGatewayClient();
+    expect(internals.usageMetadataSyncTimers.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(request).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('patchSession rejects IM channel sessions when the real OpenClaw key is missing', async () => {
@@ -2049,6 +2319,7 @@ test('pollChannelSessions syncs channel row model into the local session overrid
             key: sessionKey,
             modelProvider: 'lobsterai-server',
             model: 'kimi-k2.6-YoudaoInner',
+            contextTokens: 128_000,
           }],
         };
       }
@@ -2064,6 +2335,10 @@ test('pollChannelSessions syncs channel row model into the local session overrid
   adapter.fullySyncedSessions.add(session.id);
   adapter.sessionIdBySessionKey.set(sessionKey, session.id);
   adapter.activeTurns.set(session.id, createActiveTurn(session.id, sessionKey, 'run-active'));
+  const contextCache = (adapter as unknown as {
+    sessionContextTokensCache: Map<string, number>;
+  }).sessionContextTokensCache;
+  contextCache.set(sessionKey, 1_000_000);
 
   await adapter.pollChannelSessions();
 
@@ -2075,6 +2350,50 @@ test('pollChannelSessions syncs channel row model into the local session overrid
       options: { touchUpdatedAt: false },
     },
   ]);
+  expect(contextCache.get(sessionKey)).toBe(128_000);
+});
+
+test('pollChannelSessions ignores a sessions.list response from an old gateway generation', async () => {
+  const sessionKey = 'agent:main:feishu:dm:ou_stale';
+  let resolveSessions: ((value: { sessions: unknown[] }) => void) | undefined;
+  const oldClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise<{ sessions: unknown[] }>((resolve) => {
+      resolveSessions = resolve;
+    })),
+  };
+  const newClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(async () => ({ sessions: [] })),
+  };
+  const resolveOrCreateSession = vi.fn(() => 'session-1');
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  const internals = adapter as unknown as {
+    gatewayClient: typeof oldClient | typeof newClient;
+    gatewayClientGeneration: number;
+    sessionContextTokensCache: Map<string, number>;
+  };
+  internals.gatewayClient = oldClient;
+  internals.gatewayClientGeneration = 1;
+  adapter.channelSessionSync = {
+    isChannelSessionKey: (key: string) => key === sessionKey,
+    isCurrentBindingKey: () => true,
+    resolveOrCreateSession,
+  };
+
+  const poll = adapter.pollChannelSessions();
+  await vi.waitFor(() => expect(oldClient.request).toHaveBeenCalledTimes(1));
+  internals.gatewayClientGeneration = 2;
+  internals.gatewayClient = newClient;
+  resolveSessions?.({
+    sessions: [{ key: sessionKey, contextTokens: 128_000 }],
+  });
+
+  await poll;
+  expect(resolveOrCreateSession).not.toHaveBeenCalled();
+  expect(internals.sessionContextTokensCache.size).toBe(0);
 });
 
 test('pollChannelSessions clears stale override when channel row matches the agent default model', async () => {
@@ -3268,6 +3587,83 @@ test('BTW pending state is failed on disconnect without touching the session', a
   expect(session.status).toBe('completed');
 });
 
+test('gateway stop clears session and model context caches', () => {
+  const { adapter } = createRunTurnAdapter();
+  const internals = adapter as unknown as {
+    sessionContextTokensCache: Map<string, number>;
+    contextWindowCache: Map<string, number>;
+    contextWindowBareModelCache: Map<string, number>;
+    contextWindowCacheLoaded: boolean;
+  };
+  internals.sessionContextTokensCache.set('agent:main:lobsterai:session-1', 128_000);
+  internals.contextWindowCache.set('model-a', 128_000);
+  internals.contextWindowBareModelCache.set('model-a', 128_000);
+  internals.contextWindowCacheLoaded = true;
+
+  adapter.stopGatewayClient();
+
+  expect(internals.sessionContextTokensCache.size).toBe(0);
+  expect(internals.contextWindowCache.size).toBe(0);
+  expect(internals.contextWindowBareModelCache.size).toBe(0);
+  expect(internals.contextWindowCacheLoaded).toBe(false);
+});
+
+test('provider-aware model context cache keeps canonical refs isolated', () => {
+  const { adapter } = createRunTurnAdapter();
+  const internals = adapter as unknown as {
+    contextWindowCache: Map<string, number>;
+    contextWindowBareModelCache: Map<string, number>;
+    contextWindowCacheLoaded: boolean;
+    getContextWindowForModel: (modelRef: string) => number | undefined;
+  };
+  internals.contextWindowCacheLoaded = true;
+  internals.contextWindowCache.set('anthropic/claude', 200_000);
+  internals.contextWindowCache.set('openrouter/anthropic/claude', 1_000_000);
+  internals.contextWindowBareModelCache.set('unique-model', 128_000);
+
+  expect(internals.getContextWindowForModel('anthropic/claude')).toBe(200_000);
+  expect(internals.getContextWindowForModel('openrouter/anthropic/claude')).toBe(1_000_000);
+  expect(internals.getContextWindowForModel('unique-model')).toBe(128_000);
+  expect(internals.getContextWindowForModel('shared-model')).toBeUndefined();
+});
+
+test('model catalog loader keeps provider refs separate from slash-containing model ids', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lobsterai-model-context-'));
+  try {
+    const modelDir = path.join(stateDir, 'agents', 'main', 'agent');
+    fs.mkdirSync(modelDir, { recursive: true });
+    fs.writeFileSync(path.join(modelDir, 'models.json'), JSON.stringify({
+      providers: {
+        anthropic: {
+          models: [
+            { id: 'claude', contextWindow: 200_000 },
+            { id: 'shared', contextWindow: 100_000 },
+          ],
+        },
+        openrouter: {
+          models: [
+            { id: 'anthropic/claude', contextWindow: 1_000_000 },
+            { id: 'shared', contextWindow: 300_000 },
+          ],
+        },
+      },
+    }));
+    const adapter = new OpenClawRuntimeAdapter({} as never, {
+      getStateDir: () => stateDir,
+    } as never);
+    const getContextWindowForModel = (adapter as unknown as {
+      getContextWindowForModel: (modelRef: string) => number | undefined;
+    }).getContextWindowForModel.bind(adapter);
+
+    expect(getContextWindowForModel('anthropic/claude')).toBe(200_000);
+    expect(getContextWindowForModel('openrouter/anthropic/claude')).toBe(1_000_000);
+    expect(getContextWindowForModel('claude')).toBe(200_000);
+    expect(getContextWindowForModel('shared')).toBeUndefined();
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('BTW timeout clears its dedicated timer state without touching the session', async () => {
   vi.useFakeTimers();
   try {
@@ -3752,11 +4148,15 @@ function createReconcileStore(
         source: 'custom',
         model: options.agentModel ?? '',
       }),
-      addMessage: (sessionId: string, message: Record<string, unknown>) => {
+      addMessage: (
+        sessionId: string,
+        message: Record<string, unknown>,
+        timestamp?: number,
+      ) => {
         expect(sessionId).toBe(session.id);
         const created = {
           id: `msg-${nextId++}`,
-          timestamp: nextId,
+          timestamp: timestamp ?? nextId,
           metadata: {},
           ...message,
         };
@@ -3767,11 +4167,12 @@ function createReconcileStore(
         sessionId: string,
         beforeMessageId: string,
         message: Record<string, unknown>,
+        timestamp?: number,
       ) => {
         expect(sessionId).toBe(session.id);
         const created = {
           id: `msg-${nextId++}`,
-          timestamp: nextId,
+          timestamp: timestamp ?? nextId,
           metadata: {},
           ...message,
         };
@@ -4218,6 +4619,165 @@ test('reconcileWithHistory: already in sync — skips replace', async () => {
   expect(session.messages.length).toBe(2);
 });
 
+test('reconcileWithHistory: finalizes a matching legacy streaming row without usage', async () => {
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Hi there',
+      timestamp: 2,
+      metadata: { isStreaming: true, isFinal: false, customFlag: true },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const messageUpdateSpy = vi.fn();
+  adapter.on('messageUpdate', messageUpdateSpy);
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      messages: [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi there' },
+      ],
+    }),
+  };
+
+  await adapter.reconcileWithHistory(session.id, 'managed:session-1');
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages[1].metadata).toMatchObject({
+    isStreaming: false,
+    isFinal: true,
+    customFlag: true,
+  });
+  expect(messageUpdateSpy).toHaveBeenCalledOnce();
+});
+
+test('reconcileWithHistory: enriches matching history metadata without replacing messages', async () => {
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Hi there',
+      timestamp: 2,
+      metadata: {
+        customFlag: true,
+        usage: { outputTokens: 1 },
+      },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const messageUpdateSpy = vi.fn();
+  adapter.on('messageUpdate', messageUpdateSpy);
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'anthropic/claude-sonnet-4' },
+      messages: [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'read', input: {} }],
+          model: 'anthropic/claude-sonnet-4',
+          usage: {
+            input: 20_000,
+            output: 100,
+            cacheRead: 30_000,
+            cacheWrite: 500,
+          },
+        },
+        { role: 'tool', content: 'file contents' },
+        {
+          role: 'assistant',
+          content: 'Hi there',
+          model: 'gateway-injected',
+          usage: {
+            input_tokens: 10_000,
+            completion_tokens: 300,
+            cache_read_input_tokens: 5_000,
+            cache_creation_input_tokens: 500,
+          },
+        },
+      ],
+    }),
+  };
+
+  await adapter.reconcileWithHistory(session.id, 'agent:main:feishu:group:test');
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages[1].metadata).toMatchObject({
+    customFlag: true,
+    usage: {
+      inputTokens: 30_000,
+      outputTokens: 400,
+      cacheReadTokens: 35_000,
+      cacheWriteTokens: 1_000,
+    },
+    contextPercent: 51,
+    model: 'anthropic/claude-sonnet-4',
+  });
+  expect(messageUpdateSpy).toHaveBeenCalledOnce();
+  expect(messageUpdateSpy).toHaveBeenCalledWith(
+    session.id,
+    'msg-2',
+    'Hi there',
+    expect.objectContaining({ isStreaming: false, isFinal: true }),
+  );
+});
+
+test('reconcileWithHistory: clears stale usage while the authoritative latest turn is active', async () => {
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Working',
+      timestamp: 2,
+      metadata: {
+        isStreaming: false,
+        isFinal: true,
+        usage: { inputTokens: 99 },
+        contextPercent: 90,
+      },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        status: 'running',
+        model: 'test/model',
+        contextTokens: 100_000,
+      },
+      messages: [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: 'Working',
+          model: 'test/model',
+          usage: { input: 20_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.reconcileWithHistory(session.id, 'agent:main:feishu:group:active');
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages[1].metadata).toMatchObject({
+    isStreaming: true,
+    isFinal: false,
+  });
+  expect(session.messages[1].metadata).not.toHaveProperty('usage');
+  expect(session.messages[1].metadata).not.toHaveProperty('contextPercent');
+});
+
 test('reconcileWithHistory: compares beyond the paginated session window', async () => {
   const messages = Array.from({ length: 31 }, (_, index) => ({
     id: `msg-${index + 1}`,
@@ -4598,6 +5158,249 @@ test('reconcileWithHistory: content mismatch — triggers replace', async () => 
   expect((args.authoritative[1] as Record<string, unknown>).text).toBe('Full complete response from the model.');
 });
 
+test('reconcileWithHistory: content correction preserves local metadata and finalizes usage', async () => {
+  const { session, store, getLastReplaceArgs } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Helllo',
+      timestamp: 2,
+      metadata: { customFlag: true, isStreaming: true, isFinal: false },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: 'Hello',
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.reconcileWithHistory(session.id, 'agent:main:feishu:group:test');
+
+  expect(getLastReplaceArgs()?.authoritative[1]).toMatchObject({
+    role: 'assistant',
+    text: 'Hello',
+    metadata: {
+      customFlag: true,
+      isStreaming: false,
+      isFinal: true,
+      usage: { inputTokens: 10_000, outputTokens: 100 },
+      contextPercent: 10,
+    },
+  });
+});
+
+test('fetchSessionByKey exposes scheduled-run usage and gateway timestamps', async () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'anthropic/claude-sonnet' },
+      messages: [
+        { role: 'user', content: 'Run report', timestamp: 1000 },
+        {
+          role: 'assistant',
+          content: 'Report complete.',
+          timestamp: 2000,
+          usage: { input: 10_000, output: 100, cacheRead: 5_000, cacheWrite: 500 },
+          model: 'anthropic/claude-sonnet',
+        },
+      ],
+    }),
+  };
+
+  const session = await adapter.fetchSessionByKey('agent:main:cron:report:run:run-1');
+  const assistant = session?.messages.find((message) => message.type === 'assistant');
+
+  expect(assistant).toMatchObject({
+    content: 'Report complete.',
+    timestamp: 2000,
+    metadata: {
+      usage: {
+        inputTokens: 10_000,
+        outputTokens: 100,
+        cacheReadTokens: 5_000,
+        cacheWriteTokens: 500,
+      },
+      contextPercent: 16,
+      model: 'anthropic/claude-sonnet',
+    },
+  });
+});
+
+test('fetchSessionByKey does not lend a switched model window to the prior reply', async () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        contextTokens: 40_000,
+        modelProvider: 'provider-b',
+        model: 'shared-model',
+      },
+      messages: [
+        { role: 'user', content: 'Run report', timestamp: 1000 },
+        {
+          role: 'assistant',
+          content: 'Report complete.',
+          timestamp: 2000,
+          usage: { input: 20_000, output: 100 },
+          provider: 'provider-a',
+          model: 'shared-model',
+        },
+      ],
+    }),
+  };
+
+  const session = await adapter.fetchSessionByKey('agent:main:cron:report:run:run-model-switch');
+  const assistant = session?.messages.find((message) => message.type === 'assistant');
+
+  expect(assistant?.metadata).toMatchObject({
+    usage: { inputTokens: 20_000, outputTokens: 100 },
+    model: 'provider-a/shared-model',
+  });
+  expect(assistant?.metadata?.contextPercent).toBeUndefined();
+});
+
+test('fetchSessionByKey keeps the latest active reply streaming without partial usage', async () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        hasActiveRun: true,
+        contextTokens: 100_000,
+        model: 'anthropic/claude-sonnet',
+      },
+      messages: [
+        { role: 'user', content: 'Run report', timestamp: 1000 },
+        {
+          role: 'assistant',
+          content: 'Working on it',
+          timestamp: 2000,
+          usage: { input: 20_000, output: 100 },
+          model: 'anthropic/claude-sonnet',
+        },
+      ],
+    }),
+  };
+
+  const session = await adapter.fetchSessionByKey('agent:main:cron:report:run:run-active');
+  const assistant = session?.messages.find((message) => message.type === 'assistant');
+
+  expect(session?.status).toBe('running');
+  expect(assistant?.metadata).toMatchObject({
+    isStreaming: true,
+    isFinal: false,
+    model: 'anthropic/claude-sonnet',
+  });
+  expect(assistant?.metadata).not.toHaveProperty('usage');
+  expect(assistant?.metadata).not.toHaveProperty('contextPercent');
+});
+
+test('fetchSessionByKey keeps the session running when an active user has no reply yet', async () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        hasActiveRun: true,
+        contextTokens: 40_000,
+        model: 'new/model',
+      },
+      messages: [
+        { role: 'user', content: 'Previous request', timestamp: 1000 },
+        {
+          role: 'assistant',
+          content: 'Previous answer',
+          timestamp: 2000,
+          usage: { input: 20_000, output: 100 },
+          model: 'old/model',
+        },
+        { role: 'user', content: 'New request', timestamp: 3000 },
+      ],
+    }),
+  };
+
+  const session = await adapter.fetchSessionByKey('agent:main:cron:report:run:user-only-active');
+  const assistant = session?.messages.find((message) => message.type === 'assistant');
+
+  expect(session?.status).toBe('running');
+  expect(assistant?.metadata).toMatchObject({
+    isStreaming: false,
+    isFinal: true,
+    usage: { inputTokens: 20_000, outputTokens: 100 },
+    model: 'old/model',
+  });
+  expect(assistant?.metadata).not.toHaveProperty('contextPercent');
+});
+
+test('fetchSessionByKey preserves usage from an offline archived transcript', async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lobsterai-token-transcript-'));
+  try {
+    const transcriptId = '11111111-1111-4111-8111-111111111111';
+    const sessionsDir = path.join(stateDir, 'agents', 'main', 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionsDir, `${transcriptId}.jsonl`), [
+      JSON.stringify({
+        type: 'message',
+        timestamp: '2026-08-14T01:00:00.000Z',
+        message: { role: 'user', content: 'Run report' },
+      }),
+      JSON.stringify({
+        type: 'message',
+        timestamp: '2026-08-14T01:00:01.000Z',
+        message: {
+          role: 'assistant',
+          content: 'Report complete.',
+          usage: { input: 10_000, output: 100, cacheRead: 5_000 },
+          model: 'anthropic/claude-sonnet',
+        },
+      }),
+    ].join('\n'));
+    const adapter = new OpenClawRuntimeAdapter({} as never, {
+      getStateDir: () => stateDir,
+    } as never);
+
+    const session = await adapter.fetchSessionByKey(
+      `agent:main:cron:report:run:${transcriptId}`,
+      { sessionId: transcriptId },
+    );
+    const assistant = session?.messages.find((message) => message.type === 'assistant');
+
+    expect(assistant).toMatchObject({
+      content: 'Report complete.',
+      timestamp: Date.parse('2026-08-14T01:00:01.000Z'),
+      metadata: {
+        usage: {
+          inputTokens: 10_000,
+          outputTokens: 100,
+          cacheReadTokens: 5_000,
+        },
+        model: 'anthropic/claude-sonnet',
+      },
+    });
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('subagent history sync preserves visible local user text instead of raw outbound prompt', async () => {
   const rawOutboundPrompt = `[LobsterAI system instructions]
 hidden setup
@@ -4630,6 +5433,252 @@ previous context
     { role: 'user', text: '换一颗树再来一次', timestamp: 1, metadata: {} },
     { role: 'assistant', text: '新的作文内容', timestamp: 20 },
   ]);
+});
+
+test('subagent history sync withholds footer metadata for an active latest reply', async () => {
+  const sessionKey = 'agent:writer:subagent:active-child';
+  const { session, store, getLastReplaceSessionArgs } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Draft', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        contextTokens: 100_000,
+        model: 'claude-sonnet',
+        modelProvider: 'anthropic',
+        hasActiveSubagentRun: true,
+      },
+      messages: [
+        { role: 'user', content: 'Draft' },
+        {
+          role: 'assistant',
+          content: 'Work in progress',
+          model: 'claude-sonnet',
+          provider: 'anthropic',
+          usage: { input: 20_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncSessionHistoryFromGateway(session.id, sessionKey);
+
+  const assistant = getLastReplaceSessionArgs()?.messages.find(entry => entry.type === 'assistant');
+  expect(assistant?.metadata).toMatchObject({ isStreaming: true, isFinal: false });
+  expect(assistant?.metadata).not.toHaveProperty('usage');
+  expect(assistant?.metadata).not.toHaveProperty('contextPercent');
+  expect(adapter.sessionContextTokensCache.has(sessionKey)).toBe(false);
+});
+
+test('subagent history sync does not borrow a mismatched provider context window', async () => {
+  const sessionKey = 'agent:writer:subagent:provider-switch';
+  const { session, store, getLastReplaceSessionArgs } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Draft', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        contextTokens: 1_000_000,
+        model: 'shared-model',
+        modelProvider: 'provider-b',
+      },
+      messages: [
+        { role: 'user', content: 'Draft' },
+        {
+          role: 'assistant',
+          content: 'Complete',
+          model: 'shared-model',
+          provider: 'provider-a',
+          usage: { input: 20_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncSessionHistoryFromGateway(session.id, sessionKey);
+
+  const assistant = getLastReplaceSessionArgs()?.messages.find(entry => entry.type === 'assistant');
+  expect(assistant?.metadata).toMatchObject({
+    isStreaming: false,
+    isFinal: true,
+    usage: { inputTokens: 20_000, outputTokens: 100 },
+    model: 'provider-a/shared-model',
+  });
+  expect(assistant?.metadata).not.toHaveProperty('contextPercent');
+  expect(adapter.sessionContextTokensCache.has(sessionKey)).toBe(false);
+});
+
+test('subagent history sync ignores a response from a stale gateway generation', async () => {
+  let resolveHistory: ((value: { messages: unknown[] }) => void) | undefined;
+  const { session, store, getLastReplaceArgs } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'old request', timestamp: 1, metadata: {} },
+  ]);
+  const oldClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise<{ messages: unknown[] }>((resolve) => {
+      resolveHistory = resolve;
+    })),
+  };
+  const newClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(async () => ({ messages: [] })),
+  };
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const internals = adapter as unknown as {
+    gatewayClient: typeof oldClient | typeof newClient;
+    gatewayClientGeneration: number;
+  };
+  internals.gatewayClient = oldClient;
+  internals.gatewayClientGeneration = 1;
+
+  const sync = adapter.syncSessionHistoryFromGateway(
+    session.id,
+    'agent:writer:subagent:abc',
+  );
+  await vi.waitFor(() => expect(oldClient.request).toHaveBeenCalledTimes(1));
+  internals.gatewayClientGeneration = 2;
+  internals.gatewayClient = newClient;
+  resolveHistory?.({
+    messages: [
+      { role: 'user', content: 'new request' },
+      { role: 'assistant', content: 'new answer', usage: { input: 10_000, output: 100 } },
+    ],
+  });
+  await sync;
+
+  expect(getLastReplaceArgs()).toBeNull();
+  expect(session.messages).toHaveLength(1);
+});
+
+test('history sync keeps only the newest response for the same session key', async () => {
+  type HistoryResponse = { messages: unknown[] };
+  const resolvers: Array<(value: HistoryResponse) => void> = [];
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Question', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise<HistoryResponse>((resolve) => {
+      resolvers.push(resolve);
+    })),
+  };
+  const sessionKey = 'agent:main:feishu:group:history-race';
+
+  const olderSync = adapter.syncSessionHistoryFromGateway(session.id, sessionKey);
+  await vi.waitFor(() => expect(resolvers).toHaveLength(1));
+  const newerSync = adapter.syncSessionHistoryFromGateway(session.id, sessionKey);
+  await vi.waitFor(() => expect(resolvers).toHaveLength(2));
+
+  resolvers[1]({
+    messages: [
+      { role: 'user', content: 'Question' },
+      { role: 'assistant', content: 'Newest answer' },
+    ],
+  });
+  await newerSync;
+  resolvers[0]({
+    messages: [
+      { role: 'user', content: 'Question' },
+      { role: 'assistant', content: 'Stale answer' },
+    ],
+  });
+  await olderSync;
+
+  expect(getReplaceCallCount()).toBe(1);
+  expect(session.messages.at(-1)?.content).toBe('Newest answer');
+  expect(adapter.sessionHistorySyncTokens.size).toBe(0);
+});
+
+test('history sync lets different cron run keys complete concurrently', async () => {
+  type HistoryResponse = { messages: unknown[] };
+  const resolvers = new Map<string, (value: HistoryResponse) => void>();
+  const { session, store } = createReconcileStore([]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn((_method: string, params?: { sessionKey?: string }) => (
+      new Promise<HistoryResponse>((resolve) => {
+        if (params?.sessionKey) resolvers.set(params.sessionKey, resolve);
+      })
+    )),
+  };
+  const firstKey = 'agent:main:cron:report:run:run-concurrent-1';
+  const secondKey = 'agent:main:cron:report:run:run-concurrent-2';
+
+  const firstSync = adapter.syncSessionHistoryFromGateway(session.id, firstKey);
+  const secondSync = adapter.syncSessionHistoryFromGateway(session.id, secondKey);
+  await vi.waitFor(() => expect(resolvers.size).toBe(2));
+
+  resolvers.get(secondKey)?.({
+    messages: [
+      { role: 'user', content: 'Second run' },
+      { role: 'assistant', content: 'Second result' },
+    ],
+  });
+  await secondSync;
+  resolvers.get(firstKey)?.({
+    messages: [
+      { role: 'user', content: 'First run' },
+      { role: 'assistant', content: 'First result' },
+    ],
+  });
+  await firstSync;
+
+  const contents = session.messages.map(message => message.content);
+  expect(contents).toEqual(expect.arrayContaining([
+    'First run',
+    'First result',
+    'Second run',
+    'Second result',
+  ]));
+  expect(adapter.sessionHistorySyncTokens.size).toBe(0);
+});
+
+test('deleting a session invalidates every in-flight history sync before it can write', async () => {
+  type HistoryResponse = { messages: unknown[] };
+  let resolveHistory: ((value: HistoryResponse) => void) | undefined;
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Question', timestamp: 1, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.subagentTracker.onSessionDeleted = vi.fn();
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise<HistoryResponse>((resolve) => {
+      resolveHistory = resolve;
+    })),
+  };
+  const sync = adapter.syncSessionHistoryFromGateway(
+    session.id,
+    'agent:main:feishu:group:deleted-history',
+  );
+  await vi.waitFor(() => expect(resolveHistory).toBeTypeOf('function'));
+
+  adapter.onSessionDeleted(session.id);
+  expect(adapter.sessionHistorySyncTokens.size).toBe(0);
+  resolveHistory?.({
+    messages: [
+      { role: 'user', content: 'Question' },
+      { role: 'assistant', content: 'Late answer' },
+    ],
+  });
+  await sync;
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages).toHaveLength(1);
+  expect(adapter.sessionHistorySyncTokens.size).toBe(0);
 });
 
 test('lifecycle fallback repairs managed session assistant text from history', async () => {
@@ -6995,6 +8044,9 @@ test('visible short tool final waits with retry signal and accepts same-run cont
       message.type === 'assistant'
       && message.content === shortAnswer
     ))).toBe(true);
+    expect((adapter as unknown as {
+      usageMetadataSyncTimers: Map<string, ReturnType<typeof setTimeout>>;
+    }).usageMetadataSyncTimers.size).toBe(0);
 
     await vi.advanceTimersByTimeAsync(70_000);
     expect(completeSpy).not.toHaveBeenCalled();
@@ -7537,6 +8589,1931 @@ test('usage metadata sync ignores silent latest assistant history entries', asyn
 
   expect(session.messages[1].metadata).toEqual({});
   expect(session.messages[2].metadata).toEqual({});
+});
+
+test('usage metadata sync reads v2026.6.1 aliases and sessionInfo context', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Visible answer',
+      timestamp: 2,
+      metadata: { customFlag: true },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        contextTokens: 1_000_000,
+        model: 'anthropic/claude-sonnet-4',
+      },
+      messages: [{
+        role: 'assistant',
+        content: 'Visible answer',
+        model: 'anthropic/claude-sonnet-4',
+        usage: {
+          input_tokens: 1,
+          completion_tokens: 391,
+          cache_read_input_tokens: 438_400,
+          cache_creation_input_tokens: 307,
+        },
+      }],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    customFlag: true,
+    usage: {
+      inputTokens: 1,
+      outputTokens: 391,
+      cacheReadTokens: 438_400,
+      cacheWriteTokens: 307,
+    },
+    contextPercent: 44,
+    model: 'anthropic/claude-sonnet-4',
+  });
+});
+
+test('usage metadata sync does not borrow sessionInfo from a newer user-only turn', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'First answer', timestamp: 2, metadata: {} },
+    { id: 'msg-3', type: 'user', content: 'Second', timestamp: 3, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        contextTokens: 1_000_000,
+        model: 'new-turn/different-model',
+      },
+      messages: [
+        { role: 'user', content: 'First' },
+        {
+          role: 'assistant',
+          content: 'First answer',
+          usage: { input: 20_000, output: 100 },
+        },
+        { role: 'user', content: 'Second' },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, sessionKey, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 20_000, outputTokens: 100 },
+  });
+  expect(session.messages[1].metadata).not.toHaveProperty('contextPercent');
+  expect(session.messages[1].metadata).not.toHaveProperty('model');
+  expect((adapter as unknown as {
+    sessionContextTokensCache: Map<string, number>;
+  }).sessionContextTokensCache.has(sessionKey)).toBe(false);
+});
+
+test('usage metadata sync does not attach an identical newer reply to the old local turn', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'OK', timestamp: 2, metadata: {} },
+    { id: 'msg-3', type: 'user', content: 'Second', timestamp: 3, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'new-turn/model' },
+      messages: [
+        { role: 'user', content: 'First' },
+        { role: 'assistant', content: 'OK', usage: { input: 10_000, output: 10 } },
+        { role: 'user', content: 'Second' },
+        { role: 'assistant', content: 'OK', usage: { input: 80_000, output: 20 } },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync does not attach an identical gateway-only newer turn', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'OK', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'new-turn/model' },
+      messages: [
+        { role: 'user', content: 'First' },
+        { role: 'assistant', content: 'OK', usage: { input: 10_000, output: 10 } },
+        { role: 'user', content: 'Second' },
+        { role: 'assistant', content: 'OK', usage: { input: 80_000, output: 20 } },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync correlates wrapped managed prompts to the local user turn', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        {
+          role: 'user',
+          content: '[Session info]\nCurrent model: example/model\n\n[Current user request]\nInspect',
+        },
+        {
+          role: 'assistant',
+          content: 'Done',
+          model: 'test/model',
+          usage: { input: 10_000, output: 50 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 10_000, outputTokens: 50 },
+    contextPercent: 10,
+  });
+});
+
+test('usage metadata sync treats accepted steer input as part of the active Cowork turn', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Build report', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'Detailed report', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        {
+          role: 'user',
+          content: 'Build report',
+          idempotencyKey: 'run-steer:user',
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'read', input: {} }],
+          model: 'test/model',
+          usage: { input: 20_000, output: 50, cacheRead: 30_000, cacheWrite: 500 },
+        },
+        { role: 'tool', content: 'report data' },
+        { role: 'user', content: 'Add details' },
+        {
+          role: 'assistant',
+          content: 'Detailed report',
+          idempotencyKey: 'run-steer',
+          model: 'test/model',
+          usage: { input: 25_000, output: 75, cacheRead: 5_000, cacheWrite: 100 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      syncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+      acceptedSteerTexts: readonly string[],
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+    0,
+    undefined,
+    new Set(['run-steer:user']),
+    ['Add details'],
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: {
+      inputTokens: 45_000,
+      outputTokens: 125,
+      cacheReadTokens: 35_000,
+      cacheWriteTokens: 600,
+    },
+    contextPercent: 51,
+    model: 'test/model',
+  });
+});
+
+test('usage metadata sync does not borrow a new model window after a prior model switch', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Done',
+      timestamp: 2,
+      metadata: { model: 'model-a' },
+    },
+  ]);
+  let resolveHistory: ((value: unknown) => void) | undefined;
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise((resolve) => {
+      resolveHistory = resolve;
+    })),
+  };
+  const internals = adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+    invalidateSessionContextTokens: (sessionKey: string) => void;
+    contextWindowCache: Map<string, number>;
+    contextWindowCacheLoaded: boolean;
+  };
+  internals.contextWindowCache.set('model-a', 100_000);
+  internals.contextWindowCache.set('model-b', 40_000);
+  internals.contextWindowCacheLoaded = true;
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+  internals.invalidateSessionContextTokens(sessionKey);
+
+  const sync = internals.syncUsageMetadata(session.id, sessionKey, 'msg-2');
+  await vi.waitFor(() => expect(resolveHistory).toBeTypeOf('function'));
+  resolveHistory?.({
+    sessionInfo: { model: 'model-b', contextTokens: 40_000 },
+    messages: [
+      { role: 'user', content: 'Inspect' },
+      { role: 'assistant', content: 'Done', usage: { input: 20_000, output: 50 } },
+    ],
+  });
+  await sync;
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 20_000, outputTokens: 50 },
+    contextPercent: 20,
+    model: 'model-a',
+  });
+});
+
+test('usage metadata sync rejects sessionInfo when context cache changes during history loading', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Done',
+      timestamp: 2,
+      metadata: { model: 'model-a' },
+    },
+  ]);
+  let resolveHistory: ((value: unknown) => void) | undefined;
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise((resolve) => {
+      resolveHistory = resolve;
+    })),
+  };
+  const internals = adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+    invalidateSessionContextTokens: (sessionKey: string) => void;
+    contextWindowCache: Map<string, number>;
+    contextWindowCacheLoaded: boolean;
+  };
+  internals.contextWindowCache.set('model-a', 100_000);
+  internals.contextWindowCacheLoaded = true;
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+
+  const sync = internals.syncUsageMetadata(session.id, sessionKey, 'msg-2');
+  await vi.waitFor(() => expect(resolveHistory).toBeTypeOf('function'));
+  internals.invalidateSessionContextTokens(sessionKey);
+  resolveHistory?.({
+    sessionInfo: { model: 'model-a', contextTokens: 40_000 },
+    messages: [
+      { role: 'user', content: 'Inspect' },
+      {
+        role: 'assistant',
+        content: 'Done',
+        model: 'model-a',
+        usage: { input: 20_000, output: 50 },
+      },
+    ],
+  });
+  await sync;
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 20_000, outputTokens: 50 },
+    contextPercent: 20,
+    model: 'model-a',
+  });
+});
+
+test('usage metadata sync retries after context invalidation from an unrelated session', async () => {
+  vi.useFakeTimers();
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Done',
+      timestamp: 2,
+      metadata: { model: 'model-a' },
+    },
+  ]);
+  let resolveFirstHistory: ((value: unknown) => void) | undefined;
+  let requestCount = 0;
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return new Promise((resolve) => {
+          resolveFirstHistory = resolve;
+        });
+      }
+      return Promise.resolve({
+        sessionInfo: { model: 'model-a', contextTokens: 100_000 },
+        messages: [
+          { role: 'user', content: 'Inspect' },
+          {
+            role: 'assistant',
+            content: 'Done',
+            model: 'model-a',
+            usage: { input: 20_000, output: 50 },
+          },
+        ],
+      });
+    }),
+  };
+  const internals = adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+    invalidateSessionContextTokens: (sessionKey: string) => void;
+    usageMetadataSyncTimers: Map<string, ReturnType<typeof setTimeout>>;
+    usageMetadataSyncTokens: Map<string, symbol>;
+  };
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+
+  try {
+    const sync = internals.syncUsageMetadata(session.id, sessionKey, 'msg-2');
+    await vi.waitFor(() => expect(resolveFirstHistory).toBeTypeOf('function'));
+    internals.invalidateSessionContextTokens('agent:main:lobsterai:other-session');
+    resolveFirstHistory?.({
+      sessionInfo: { model: 'model-a', contextTokens: 100_000 },
+      messages: [
+        { role: 'user', content: 'Inspect' },
+        {
+          role: 'assistant',
+          content: 'Done',
+          model: 'model-a',
+          usage: { input: 20_000, output: 50 },
+        },
+      ],
+    });
+    await sync;
+
+    expect(session.messages[1].metadata).toMatchObject({
+      usage: { inputTokens: 20_000, outputTokens: 50 },
+      model: 'model-a',
+    });
+    expect(session.messages[1].metadata?.contextPercent).toBeUndefined();
+    expect(internals.usageMetadataSyncTimers.size).toBe(1);
+    expect(internals.usageMetadataSyncTokens.size).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => {
+      expect(session.messages[1].metadata?.contextPercent).toBe(20);
+    });
+    expect(requestCount).toBe(2);
+    expect(internals.usageMetadataSyncTimers.size).toBe(0);
+    expect(internals.usageMetadataSyncTokens.size).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('usage metadata sync uses the authoritative history model for catalog fallback', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Done',
+      timestamp: 2,
+      metadata: { model: 'model-a' },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (method: string) => method === 'chat.history'
+      ? {
+        messages: [
+          { role: 'user', content: 'Inspect' },
+          {
+            role: 'assistant',
+            content: 'Done',
+            model: 'model-b',
+            usage: { input: 100_000, output: 50 },
+          },
+        ],
+      }
+      : { sessions: [] },
+  };
+  const internals = adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+    contextWindowCache: Map<string, number>;
+    contextWindowCacheLoaded: boolean;
+  };
+  internals.contextWindowCache.set('model-a', 100_000);
+  internals.contextWindowCache.set('model-b', 200_000);
+  internals.contextWindowCacheLoaded = true;
+
+  await internals.syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 100_000, outputTokens: 50 },
+    contextPercent: 50,
+    model: 'model-b',
+  });
+});
+
+test.each([
+  {
+    label: 'goal bootstrap command',
+    localContent: '/goal start Ship the release',
+    localMetadata: { goalSetting: { action: 'start', objective: 'Ship the release' } },
+    historyContent: 'Ship the release',
+  },
+  {
+    label: 'command-like goal objective',
+    localContent: '/goal set Fix /api first',
+    localMetadata: { goalSetting: { action: 'set', objective: 'Fix /api first' } },
+    historyContent: 'Pursue this goal exactly as written from this JSON string: "Fix \\/api first"',
+  },
+  {
+    label: 'goal resume note',
+    localContent: 'Continue pursuing the current goal. Note: focus on tests',
+    localMetadata: {},
+    historyContent: 'Continue pursuing the current goal. Note: focus on tests',
+  },
+  {
+    label: 'goal resume without a note',
+    localContent: 'Continue pursuing the current goal.',
+    localMetadata: {},
+    historyContent: 'Continue pursuing the current goal.',
+  },
+])('usage metadata sync correlates $label', async ({
+  localContent,
+  localMetadata,
+  historyContent,
+}) => {
+  const { session, store } = createReconcileStore([
+    {
+      id: 'msg-1',
+      type: 'user',
+      content: localContent,
+      timestamp: 1,
+      metadata: localMetadata,
+    },
+    { id: 'msg-2', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: `[Current user request]\n${historyContent}` },
+        { role: 'assistant', content: 'Done', usage: { input: 10_000, output: 100 } },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 10_000, outputTokens: 100 },
+  });
+});
+
+test('usage metadata sync rejects duplicate turn pairs in a bounded history window', async () => {
+  const localMessages = Array.from({ length: 29 }, (_, index) => ([
+    {
+      id: `user-${index}`,
+      type: 'user' as const,
+      content: `Earlier request ${index}`,
+      timestamp: index * 2 + 1,
+      metadata: {},
+    },
+    {
+      id: `assistant-${index}`,
+      type: 'assistant' as const,
+      content: `Earlier answer ${index}`,
+      timestamp: index * 2 + 2,
+      metadata: {},
+    },
+  ])).flat();
+  localMessages.push(
+    { id: 'msg-user', type: 'user', content: 'Continue', timestamp: 100, metadata: {} },
+    { id: 'msg-assistant', type: 'assistant', content: 'OK', timestamp: 101, metadata: {} },
+  );
+  const { session, store } = createReconcileStore(localMessages);
+  const boundedHistory = Array.from({ length: 23 }, (_, index) => ([
+    { role: 'user', content: `Window request ${index}` },
+    { role: 'assistant', content: `Window answer ${index}` },
+  ])).flat();
+  boundedHistory.push(
+    { role: 'user', content: 'Continue' },
+    { role: 'assistant', content: 'OK', usage: { input: 10_000, output: 10 } },
+    { role: 'user', content: 'Continue' },
+    { role: 'assistant', content: 'OK', usage: { input: 80_000, output: 20 } },
+  );
+  const completeHistory = [
+    ...Array.from({ length: 29 }, (_, index) => ([
+      { role: 'user', content: `Earlier request ${index}` },
+      { role: 'assistant', content: `Earlier answer ${index}` },
+    ])).flat(),
+    { role: 'user', content: 'Continue' },
+    { role: 'assistant', content: 'OK', usage: { input: 10_000, output: 10 } },
+    { role: 'user', content: 'Continue' },
+    { role: 'assistant', content: 'OK', usage: { input: 80_000, output: 20 } },
+  ];
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => ({
+      sessionInfo: { contextTokens: 100_000 },
+      messages: (params as { limit?: number } | undefined)?.limit === 50
+        ? boundedHistory
+        : completeHistory,
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-assistant',
+  );
+
+  expect(session.messages.at(-1)?.metadata).toEqual({});
+});
+
+test('usage metadata sync rejects duplicate turn pairs in a short history window', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'user-1', type: 'user', content: 'Continue', timestamp: 1, metadata: {} },
+    { id: 'assistant-1', type: 'assistant', content: 'OK', timestamp: 2, metadata: {} },
+    { id: 'user-2', type: 'user', content: 'Continue', timestamp: 3, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000 },
+      messages: [
+        { role: 'user', content: 'Continue' },
+        { role: 'assistant', content: 'OK', usage: { input: 10_000, output: 10 } },
+        { role: 'user', content: 'Continue' },
+        {
+          role: 'assistant',
+          content: 'OK',
+          model: 'test/model',
+          usage: { input: 80_000, output: 20 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'assistant-1',
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync accepts the latest duplicate turn in a complete short history', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'user-1', type: 'user', content: 'Continue', timestamp: 1, metadata: {} },
+    { id: 'assistant-1', type: 'assistant', content: 'OK', timestamp: 2, metadata: {} },
+    { id: 'user-2', type: 'user', content: 'Continue', timestamp: 3, metadata: {} },
+    { id: 'assistant-2', type: 'assistant', content: 'OK', timestamp: 4, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: 'Continue' },
+        { role: 'assistant', content: 'OK', usage: { input: 10_000, output: 10 } },
+        { role: 'user', content: 'Continue' },
+        {
+          role: 'assistant',
+          content: 'OK',
+          model: 'test/model',
+          usage: { input: 80_000, output: 20 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'assistant-2',
+  );
+
+  expect(session.messages[3].metadata).toMatchObject({
+    usage: { inputTokens: 80_000, outputTokens: 20 },
+    contextPercent: 80,
+  });
+});
+
+test('usage metadata sync rejects a bounded turn with no user anchor after a newer local user', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'user-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+    { id: 'assistant-1', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+    { id: 'user-2', type: 'user', content: 'Second', timestamp: 3, metadata: {} },
+  ]);
+  const boundedTurn = Array.from({ length: 49 }, (_, index) => ({
+    role: 'assistant',
+    content: [{ type: 'tool_use', name: `tool-${index}`, input: {} }],
+    usage: { input: 1_000 + index, output: 1 },
+  }));
+  boundedTurn.push({
+    role: 'assistant',
+    content: 'Done',
+    usage: { input: 80_000, output: 20 },
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => {
+      const limit = (params as { limit?: number } | undefined)?.limit;
+      return {
+        sessionInfo: { contextTokens: 100_000 },
+        messages: limit === 200
+          ? [{ role: 'user', content: 'Second', idempotencyKey: 'run-new:user' }, ...boundedTurn]
+          : boundedTurn,
+      };
+    },
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      existingSyncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'assistant-1',
+    0,
+    undefined,
+    new Set(['run-old:user']),
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync rejects an unseen newer long turn with the same final text', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'user-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+    { id: 'assistant-1', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const boundedNewTurn = Array.from({ length: 49 }, (_, index) => ({
+    role: 'assistant',
+    content: [{ type: 'tool_use', name: `tool-${index}`, input: {} }],
+    usage: { input: 1_000 + index, output: 1 },
+  }));
+  boundedNewTurn.push({
+    role: 'assistant',
+    content: 'Done',
+    usage: { input: 80_000, output: 20 },
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => ({
+      sessionInfo: { contextTokens: 100_000 },
+      messages: (params as { limit?: number } | undefined)?.limit === 200
+        ? [{ role: 'user', content: 'Second', idempotencyKey: 'run-new:user' }, ...boundedNewTurn]
+        : boundedNewTurn,
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      existingSyncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'assistant-1',
+    2,
+    undefined,
+    new Set(['run-old:user']),
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync keeps a bounded partial aggregate for the current long turn', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'user-1', type: 'user', content: 'Inspect deeply', timestamp: 1, metadata: {} },
+    { id: 'assistant-1', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const boundedTurn = Array.from({ length: 49 }, (_, index) => ({
+    role: 'assistant',
+    content: [{ type: 'tool_use', name: `tool-${index}`, input: {} }],
+    usage: { input: 1_000 + index, output: 1 },
+  }));
+  boundedTurn.push({
+    role: 'assistant',
+    content: 'Done',
+    model: 'test/model',
+    usage: { input: 80_000, output: 20 },
+  });
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => {
+      const limit = (params as { limit?: number } | undefined)?.limit;
+      return {
+        sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+        messages: limit === 200
+          ? [{
+            role: 'user',
+            content: 'Inspect deeply',
+            idempotencyKey: 'run-current:user',
+          }, ...boundedTurn]
+          : boundedTurn,
+      };
+    },
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      existingSyncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'assistant-1',
+    0,
+    undefined,
+    new Set(['run-current:user']),
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 130_176, outputTokens: 69 },
+    contextPercent: 80,
+  });
+});
+
+test('usage metadata sync performs at most one expanded lookup for a missing strong anchor', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'user-1', type: 'user', content: 'Inspect deeply', timestamp: 1, metadata: {} },
+    { id: 'assistant-1', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const requestedLimits: number[] = [];
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => {
+      const limit = (params as { limit?: number } | undefined)?.limit ?? 50;
+      requestedLimits.push(limit);
+      // OpenClaw can byte-cap a requested 200-message response to fewer rows
+      // without returning a truncation marker. A short expanded array still
+      // cannot be treated as complete when the strong run anchor is absent.
+      const responseCount = limit === 200 ? 51 : 50;
+      return {
+        sessionInfo: { contextTokens: 100_000 },
+        messages: [
+          ...Array.from({ length: responseCount - 1 }, (_, index) => ({
+            role: 'assistant',
+            content: [{ type: 'tool_use', name: `tool-${index}`, input: {} }],
+          })),
+          {
+            role: 'assistant',
+            content: 'Done',
+            usage: { input: 80_000, output: 20 },
+          },
+        ],
+      };
+    },
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      existingSyncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'assistant-1',
+    2,
+    undefined,
+    new Set(['run-current:user']),
+  );
+
+  expect(requestedLimits).toEqual([50, 200]);
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync aggregates tool-loop calls and uses the largest prompt for ctx', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'Final answer', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: {
+        contextTokens: 1_000_000,
+        model: 'anthropic/claude-sonnet-4',
+      },
+      messages: [
+        { role: 'user', content: 'Inspect' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'read', input: {} }],
+          model: 'anthropic/claude-sonnet-4',
+          usage: { input: 1, output: 100, cacheRead: 438_400, cacheWrite: 307 },
+        },
+        { role: 'tool', content: 'file contents' },
+        {
+          role: 'assistant',
+          content: 'Final answer',
+          usage: { input: 10_000, output: 250, cacheRead: 1_000 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: {
+      inputTokens: 10_001,
+      outputTokens: 350,
+      cacheReadTokens: 439_400,
+      cacheWriteTokens: 307,
+    },
+    contextPercent: 44,
+    model: 'anthropic/claude-sonnet-4',
+  });
+});
+
+test('usage metadata sync correlates an automatically wrapped plan with raw history text', async () => {
+  const rawPlan = '## Summary\n\nImplement the requested change.';
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Plan it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: `<proposed_plan>\n${rawPlan}\n</proposed_plan>`,
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: 'Plan it' },
+        {
+          role: 'assistant',
+          content: rawPlan,
+          model: 'test/model',
+          usage: { input: 10_000, output: 250 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 10_000, outputTokens: 250 },
+    contextPercent: 10,
+  });
+});
+
+test('usage metadata sync treats plan recovery prompts as the same visible turn', async () => {
+  const finalPlan = '## Summary\n\nImplement the requested change.';
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Plan it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: `<proposed_plan>\n${finalPlan}\n</proposed_plan>`,
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: 'Plan it' },
+        {
+          role: 'assistant',
+          content: 'I will prepare the plan.',
+          usage: { input: 10_000, output: 50 },
+        },
+        {
+          role: 'user',
+          content: PLAN_MODE_RECOVERY_USAGE_CONTINUATION_PROMPT,
+        },
+        {
+          role: 'assistant',
+          content: finalPlan,
+          model: 'test/model',
+          usage: { input: 20_000, output: 250 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 30_000, outputTokens: 300 },
+    contextPercent: 20,
+  });
+});
+
+test('usage metadata sync expands past a bounded plan-recovery-only user anchor', async () => {
+  const finalPlan = '## Summary\n\nImplement the requested change.';
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Plan it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: `<proposed_plan>\n${finalPlan}\n</proposed_plan>`,
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const boundedRecoveryTail = [
+    {
+      role: 'user',
+      content: PLAN_MODE_RECOVERY_USAGE_CONTINUATION_PROMPT,
+      idempotencyKey: 'run-recovery:user',
+    },
+    ...Array.from({ length: 48 }, (_, index) => ({
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: `tool-${index}`, input: {} }],
+    })),
+    {
+      role: 'assistant',
+      content: finalPlan,
+      model: 'test/model',
+      usage: { input: 20_000, output: 250 },
+    },
+  ];
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: (params as { limit?: number } | undefined)?.limit === 200
+        ? [
+          { role: 'user', content: 'Plan it', idempotencyKey: 'run-original:user' },
+          {
+            role: 'assistant',
+            content: 'I will prepare the plan.',
+            usage: { input: 10_000, output: 50 },
+          },
+          ...boundedRecoveryTail,
+        ]
+        : boundedRecoveryTail,
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      existingSyncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+    0,
+    undefined,
+    new Set(['run-original:user', 'run-recovery:user']),
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 30_000, outputTokens: 300 },
+    contextPercent: 20,
+  });
+});
+
+test('usage metadata sync does not hide a real user request that only shares a recovery prefix', async () => {
+  const userRequest = '[Plan Mode recovery instruction]\nPlease explain this literal text.';
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: userRequest, timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'Explained.', timestamp: 2, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000 },
+      messages: [
+        { role: 'user', content: userRequest },
+        { role: 'assistant', content: 'Explained.', usage: { input: 10_000, output: 100 } },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 10_000, outputTokens: 100 },
+  });
+});
+
+test('usage metadata sync rejects a normal prose suffix from lagging history', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Run it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Starting\n\nFinal result',
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      messages: [
+        { role: 'user', content: 'Run it' },
+        { role: 'assistant', content: 'Starting', usage: { input: 10_000, output: 10 } },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+    2,
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync accepts only app-appended file links after history text', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Create it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Created the report.\n\n[report.txt](/tmp/report.txt)\n[summary.txt](C:\\Temp\\summary.txt)',
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: 'Create it' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'toolCall',
+              name: 'message',
+              arguments: { action: 'send', filePath: '/tmp/report.txt' },
+            },
+            {
+              type: 'toolCall',
+              name: 'message',
+              arguments: { action: 'send', filePath: 'C:\\Temp\\summary.txt' },
+            },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: 'Created the report.',
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+  }).syncUsageMetadata(session.id, `agent:main:lobsterai:${session.id}`, 'msg-2');
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 10_000, outputTokens: 100 },
+    contextPercent: 10,
+  });
+});
+
+test('usage metadata sync accepts the exact file-link suffix from the initial bounded tail', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Create it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'Created.\n\n[recent.pdf](./tmp/recent.pdf)',
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const boundedTail = [
+    ...Array.from({ length: 48 }, (_, index) => ({
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: `tool-${index}`, input: {} }],
+    })),
+    {
+      role: 'assistant',
+      content: [{
+        type: 'toolCall',
+        name: 'message',
+        arguments: { action: 'send', filePath: './tmp/recent.pdf' },
+      }],
+    },
+    {
+      role: 'assistant',
+      content: 'Created.',
+      model: 'test/model',
+      usage: { input: 10_000, output: 100 },
+    },
+  ];
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async (_method: string, params?: unknown) => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: (params as { limit?: number } | undefined)?.limit === 200
+        ? [
+          { role: 'user', content: 'Create it', idempotencyKey: 'run-files:user' },
+          {
+            role: 'assistant',
+            content: [{
+              type: 'toolCall',
+              name: 'message',
+              arguments: { action: 'send', filePath: '/tmp/old.pdf' },
+            }],
+          },
+          ...boundedTail,
+        ]
+        : boundedTail,
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+      existingSyncToken: symbol | undefined,
+      expectedUserIdempotencyKeys: ReadonlySet<string>,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+    0,
+    undefined,
+    new Set(['run-files:user']),
+  );
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 10_000, outputTokens: 100 },
+    contextPercent: 10,
+  });
+});
+
+test('usage metadata sync rejects an appended web link as ordinary assistant prose', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Explain it', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: 'See the documentation.\n\n[docs](https://example.com/docs)',
+      timestamp: 2,
+      metadata: {},
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      messages: [
+        { role: 'user', content: 'Explain it' },
+        {
+          role: 'assistant',
+          content: 'See the documentation.',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      retryIndex: number,
+    ) => Promise<void>;
+  }).syncUsageMetadata(
+    session.id,
+    `agent:main:lobsterai:${session.id}`,
+    'msg-2',
+    2,
+  );
+
+  expect(session.messages[1].metadata).toEqual({});
+});
+
+test('usage metadata sync retries lagging history without crossing into the next turn', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'First answer', timestamp: 2, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    let historyRequestCount = 0;
+    adapter.gatewayClient = {
+      start: () => {},
+      stop: () => {},
+      request: async () => {
+        historyRequestCount += 1;
+        if (historyRequestCount === 1) {
+          return {
+            sessionInfo: { contextTokens: 200_000 },
+            messages: [{ role: 'assistant', content: 'First answer' }],
+          };
+        }
+        return {
+          sessionInfo: { contextTokens: 200_000 },
+          messages: [{
+            role: 'assistant',
+            content: 'Second answer',
+            usage: { input: 80_000, output: 300 },
+          }],
+        };
+      },
+    };
+
+    const syncUsageMetadata = (adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+    }).syncUsageMetadata.bind(adapter);
+    await syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-2',
+    );
+
+    session.messages.push(
+      { id: 'msg-3', type: 'user', content: 'Second', timestamp: 3, metadata: {} },
+      { id: 'msg-4', type: 'assistant', content: 'Second answer', timestamp: 4, metadata: {} },
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(historyRequestCount).toBe(2);
+    expect(session.messages[1].metadata).toEqual({});
+    expect(session.messages[3].metadata).toEqual({});
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('usage metadata sync backfills the prior reply when a newer local user never reached history', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'First answer', timestamp: 2, metadata: {} },
+      { id: 'msg-3', type: 'user', content: 'Second', timestamp: 3, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    let historyRequestCount = 0;
+    adapter.gatewayClient = {
+      start: () => {},
+      stop: () => {},
+      request: async () => {
+        historyRequestCount += 1;
+        return {
+          sessionInfo: { contextTokens: 1_000_000, model: 'new/model' },
+          messages: [
+            { role: 'user', content: 'First' },
+            {
+              role: 'assistant',
+              content: 'First answer',
+              usage: { input: 20_000, output: 100 },
+            },
+          ],
+        };
+      },
+    };
+
+    await (adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+    }).syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-2',
+    );
+    expect(session.messages[1].metadata).toMatchObject({
+      usage: { inputTokens: 20_000, outputTokens: 100 },
+    });
+    expect(session.messages[1].metadata).not.toHaveProperty('contextPercent');
+    expect(session.messages[1].metadata).not.toHaveProperty('model');
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(historyRequestCount).toBe(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('usage metadata sync retries when history still points at the previous turn', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'First', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'Previous answer', timestamp: 2, metadata: {} },
+      { id: 'msg-3', type: 'user', content: 'Second', timestamp: 3, metadata: {} },
+      { id: 'msg-4', type: 'assistant', content: 'Current answer', timestamp: 4, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    let historyRequestCount = 0;
+    adapter.gatewayClient = {
+      start: () => {},
+      stop: () => {},
+      request: async () => {
+        historyRequestCount += 1;
+        return {
+          sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+          messages: [
+            { role: 'user', content: 'First' },
+            {
+              role: 'assistant',
+              content: 'Previous answer',
+              usage: { input: 10_000, output: 50 },
+            },
+            ...(historyRequestCount > 1 ? [
+              { role: 'user', content: 'Second' },
+              {
+                role: 'assistant',
+                content: 'Current answer',
+                model: 'test/model',
+                usage: { input: 25_000, output: 125 },
+              },
+            ] : []),
+          ],
+        };
+      },
+    };
+
+    await (adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+    }).syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-4',
+    );
+    expect(session.messages[3].metadata).toEqual({});
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(historyRequestCount).toBe(2);
+    expect(session.messages[3].metadata).toMatchObject({
+      usage: { inputTokens: 25_000, outputTokens: 125 },
+      contextPercent: 25,
+    });
+    expect(session.messages[1].metadata).toEqual({});
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('usage metadata sync retries once history publishes usage for the same message', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'Hello', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'Answer', timestamp: 2, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    let historyRequestCount = 0;
+    adapter.gatewayClient = {
+      start: () => {},
+      stop: () => {},
+      request: async () => {
+        historyRequestCount += 1;
+        return {
+          sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+          messages: [{
+            role: 'assistant',
+            content: 'Answer',
+            ...(historyRequestCount > 1 && {
+              model: 'test/model',
+              usage: { input: 10_000, output: 250, cacheRead: 5_000 },
+            }),
+          }],
+        };
+      },
+    };
+
+    const syncUsageMetadata = (adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+    }).syncUsageMetadata.bind(adapter);
+    await syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-2',
+    );
+    expect(session.messages[1].metadata).toEqual({});
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(historyRequestCount).toBe(2);
+    expect(session.messages[1].metadata).toMatchObject({
+      usage: {
+        inputTokens: 10_000,
+        outputTokens: 250,
+        cacheReadTokens: 5_000,
+      },
+      contextPercent: 15,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('usage metadata sync retries when only earlier tool calls have published usage', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'Answer', timestamp: 2, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    let historyRequestCount = 0;
+    adapter.gatewayClient = {
+      start: () => {},
+      stop: () => {},
+      request: async () => {
+        historyRequestCount += 1;
+        return {
+          sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+          messages: [
+            { role: 'user', content: 'Inspect' },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', name: 'read', input: {} }],
+              usage: { input: 20_000, output: 50 },
+            },
+            { role: 'tool', content: 'file contents' },
+            {
+              role: 'assistant',
+              content: 'Answer',
+              ...(historyRequestCount > 1 && {
+                model: 'test/model',
+                usage: { input: 25_000, output: 75 },
+              }),
+            },
+          ],
+        };
+      },
+    };
+
+    const syncUsageMetadata = (adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+    }).syncUsageMetadata.bind(adapter);
+    await syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-2',
+    );
+    expect(session.messages[1].metadata).toEqual({});
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(historyRequestCount).toBe(2);
+    expect(session.messages[1].metadata).toMatchObject({
+      usage: { inputTokens: 45_000, outputTokens: 125 },
+      contextPercent: 25,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('usage metadata sync retries an empty tool-only assistant tail', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'Answer', timestamp: 2, metadata: {} },
+    ]);
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    let historyRequestCount = 0;
+    adapter.gatewayClient = {
+      start: () => {},
+      stop: () => {},
+      request: async () => ({
+        sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+        messages: historyRequestCount++ === 0
+          ? [
+            { role: 'user', content: 'Inspect' },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', name: 'read', input: {} }],
+              model: 'test/model',
+              usage: { input: 20_000, output: 50 },
+            },
+          ]
+          : [
+            { role: 'user', content: 'Inspect' },
+            {
+              role: 'assistant',
+              content: [{ type: 'tool_use', name: 'read', input: {} }],
+              usage: { input: 20_000, output: 50 },
+            },
+            { role: 'tool', content: 'file contents' },
+            {
+              role: 'assistant',
+              content: 'Answer',
+              model: 'test/model',
+              usage: { input: 25_000, output: 75 },
+            },
+          ],
+      }),
+    };
+
+    const syncUsageMetadata = (adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+    }).syncUsageMetadata.bind(adapter);
+    await syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-2',
+    );
+    expect(session.messages[1].metadata).toEqual({});
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(historyRequestCount).toBe(2);
+    expect(session.messages[1].metadata).toMatchObject({
+      usage: { inputTokens: 45_000, outputTokens: 125 },
+      contextPercent: 25,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('newer usage history wins when two enrichment requests finish out of order', async () => {
+  const { session, store } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+  ]);
+  const historyResolvers: Array<(value: unknown) => void> = [];
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: vi.fn(() => new Promise((resolve) => {
+      historyResolvers.push(resolve);
+    })),
+  };
+  const syncUsageMetadata = (adapter as unknown as {
+    syncUsageMetadata: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+    ) => Promise<void>;
+    usageMetadataSyncTokens: Map<string, symbol>;
+  }).syncUsageMetadata.bind(adapter);
+  const sessionKey = `agent:main:lobsterai:${session.id}`;
+
+  const olderRequest = syncUsageMetadata(session.id, sessionKey, 'msg-2');
+  await vi.waitFor(() => expect(historyResolvers).toHaveLength(1));
+  const newerRequest = syncUsageMetadata(session.id, sessionKey, 'msg-2');
+  await vi.waitFor(() => expect(historyResolvers).toHaveLength(2));
+
+  historyResolvers[1]({
+    sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+    messages: [
+      { role: 'user', content: 'Inspect' },
+      {
+        role: 'assistant',
+        content: 'Done',
+        model: 'test/model',
+        usage: { input: 20_000, output: 200 },
+      },
+    ],
+  });
+  await newerRequest;
+  historyResolvers[0]({
+    sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+    messages: [
+      { role: 'user', content: 'Inspect' },
+      {
+        role: 'assistant',
+        content: 'Done',
+        model: 'test/model',
+        usage: { input: 10_000, output: 100 },
+      },
+    ],
+  });
+  await olderRequest;
+
+  expect(session.messages[1].metadata).toMatchObject({
+    usage: { inputTokens: 20_000, outputTokens: 200 },
+    contextPercent: 20,
+  });
+  expect((adapter as unknown as {
+    usageMetadataSyncTokens: Map<string, symbol>;
+  }).usageMetadataSyncTokens.size).toBe(0);
+});
+
+test('clearing a session during usage history prevents retry resurrection', async () => {
+  vi.useFakeTimers();
+  try {
+    const { session, store } = createReconcileStore([
+      { id: 'msg-1', type: 'user', content: 'Inspect', timestamp: 1, metadata: {} },
+      { id: 'msg-2', type: 'assistant', content: 'Done', timestamp: 2, metadata: {} },
+    ]);
+    let resolveHistory: ((value: unknown) => void) | undefined;
+    const request = vi.fn(() => new Promise((resolve) => {
+      resolveHistory = resolve;
+    }));
+    const adapter = new OpenClawRuntimeAdapter(store, {});
+    adapter.gatewayClient = { start: () => {}, stop: () => {}, request };
+    const internals = adapter as unknown as {
+      syncUsageMetadata: (
+        sessionId: string,
+        sessionKey: string,
+        assistantMessageId: string,
+      ) => Promise<void>;
+      clearUsageMetadataSyncTimersForSession: (sessionId: string) => void;
+      usageMetadataSyncTimers: Map<string, ReturnType<typeof setTimeout>>;
+      usageMetadataSyncTokens: Map<string, symbol>;
+    };
+
+    const sync = internals.syncUsageMetadata(
+      session.id,
+      `agent:main:lobsterai:${session.id}`,
+      'msg-2',
+    );
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1));
+    internals.clearUsageMetadataSyncTimersForSession(session.id);
+    resolveHistory?.({ messages: [] });
+    await sync;
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(internals.usageMetadataSyncTimers.size).toBe(0);
+    expect(internals.usageMetadataSyncTokens.size).toBe(0);
+    expect(session.messages[1].metadata).toEqual({});
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('memory maintenance wait is canceled when a follow-up run starts', async () => {
@@ -8091,7 +11068,39 @@ test('reconcileWithHistory: tail window starting with assistant updates anchored
     { role: 'user', text: 'First question', timestamp: 1, metadata: {} },
     { role: 'assistant', text: 'First answer', timestamp: 2, metadata: {} },
     { role: 'user', text: 'Second question', timestamp: 3 },
-    { role: 'assistant', text: 'Full complete answer from gateway.' },
+    { role: 'assistant', text: 'Full complete answer from gateway.', timestamp: 4 },
+  ]);
+});
+
+test('reconcileWithHistory: unmatched assistant-only bounded tail cannot delete local history', async () => {
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: 'First question', timestamp: 1, metadata: {} },
+    { id: 'msg-2', type: 'assistant', content: 'First answer', timestamp: 2, metadata: {} },
+    { id: 'msg-3', type: 'user', content: 'Second question', timestamp: 3, metadata: {} },
+    { id: 'msg-4', type: 'assistant', content: 'Streaming partial...', timestamp: 4, metadata: {} },
+  ]);
+
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      // A long tool loop can evict the user boundary from a byte/count-bounded
+      // history response while the terminal assistant corrects local partial text.
+      messages: [
+        { role: 'assistant', content: 'Full complete answer from gateway.' },
+      ],
+    }),
+  };
+
+  await adapter.reconcileWithHistory(session.id, 'managed:session-1');
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages.map(message => [message.type, message.content])).toEqual([
+    ['user', 'First question'],
+    ['assistant', 'First answer'],
+    ['user', 'Second question'],
+    ['assistant', 'Streaming partial...'],
   ]);
 });
 
@@ -8121,9 +11130,9 @@ test('reconcileWithHistory: tail window repairs stale leading assistant before a
   expect(getReplaceCallCount()).toBe(1);
   expect(getLastReplaceArgs()!.authoritative).toEqual([
     { role: 'user', text: 'First question', timestamp: 1, metadata: {} },
-    { role: 'assistant', text: 'Correct previous answer' },
+    { role: 'assistant', text: 'Correct previous answer', timestamp: 2 },
     { role: 'user', text: 'Second question', timestamp: 3 },
-    { role: 'assistant', text: 'Full complete answer from gateway.' },
+    { role: 'assistant', text: 'Full complete answer from gateway.', timestamp: 4 },
   ]);
 });
 
@@ -8455,7 +11464,13 @@ test('syncFullChannelHistory seeds gateway history cursor so old reminders are n
 test('syncFullChannelHistory: cron run history backfills initial run without losing old behavior', async () => {
   const cronKey = 'agent:main:cron:drink-water:run:run-1';
   const { session, store, getReplaceCallCount } = createReconcileStore([
-    { id: 'msg-1', type: 'assistant', content: '喝水时间到', timestamp: 1, metadata: { isStreaming: false, isFinal: true } },
+    {
+      id: 'msg-1',
+      type: 'assistant',
+      content: '喝水时间到',
+      timestamp: 1,
+      metadata: { isStreaming: false, isFinal: true, customFlag: true },
+    },
   ]);
 
   const adapter = new OpenClawRuntimeAdapter(store, {});
@@ -8463,9 +11478,15 @@ test('syncFullChannelHistory: cron run history backfills initial run without los
     start: () => {},
     stop: () => {},
     request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
       messages: [
         { role: 'user', content: '提醒我喝水' },
-        { role: 'assistant', content: '喝水时间到' },
+        {
+          role: 'assistant',
+          content: '喝水时间到',
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
       ],
     }),
   };
@@ -8480,6 +11501,57 @@ test('syncFullChannelHistory: cron run history backfills initial run without los
     { type: 'user', content: '提醒我喝水' },
     { type: 'assistant', content: '喝水时间到' },
   ]);
+  expect(session.messages.find((message) => message.type === 'assistant')?.metadata).toMatchObject({
+    customFlag: true,
+    usage: { inputTokens: 10_000, outputTokens: 100 },
+    contextPercent: 10,
+  });
+});
+
+test('syncFullChannelHistory: first cron sync replaces partial text without duplication', async () => {
+  const cronKey = 'agent:main:cron:report:run:run-first-correction';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    { id: 'msg-1', type: 'user', content: '生成报告', timestamp: 1, metadata: {} },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: '报告生成中…',
+      timestamp: 2,
+      metadata: { customFlag: true, isStreaming: true, isFinal: false },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: '生成报告' },
+        {
+          role: 'assistant',
+          content: '报告已完成。',
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncFullChannelHistory(session.id, cronKey);
+
+  expect(getReplaceCallCount()).toBe(1);
+  const assistants = session.messages.filter(message => message.type === 'assistant');
+  expect(assistants).toHaveLength(1);
+  expect(assistants[0]).toMatchObject({
+    content: '报告已完成。',
+    metadata: {
+      customFlag: true,
+      isStreaming: false,
+      isFinal: true,
+      usage: { inputTokens: 10_000, outputTokens: 100 },
+    },
+  });
 });
 
 test('syncFullChannelHistory: cron run history does not replace follow-up messages', async () => {
@@ -8512,6 +11584,187 @@ test('syncFullChannelHistory: cron run history does not replace follow-up messag
   expect(conversation).toContain('assistant:已改为每天 10:00。');
   expect(conversation.filter((entry) => entry === 'assistant:喝水时间到')).toHaveLength(1);
   expect(conversation).toContain('user:提醒我喝水');
+});
+
+test('syncFullChannelHistory: cron metadata backfill preserves content and final state', async () => {
+  const cronKey = 'agent:main:cron:drink-water:run:run-1';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    {
+      id: 'msg-1',
+      type: 'user',
+      content: '提醒我喝水',
+      timestamp: 1,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: cronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+      },
+    },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: '  喝水时间到\n',
+      timestamp: 2,
+      metadata: {
+        customFlag: true,
+        [OpenClawCronRunMetadataKey.SessionKey]: cronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+      },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const messageUpdateSpy = vi.fn();
+  adapter.on('messageUpdate', messageUpdateSpy);
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'anthropic/claude-sonnet-4' },
+      messages: [
+        { role: 'user', content: '提醒我喝水' },
+        {
+          role: 'assistant',
+          content: '喝水时间到',
+          model: 'anthropic/claude-sonnet-4',
+          usage: { input: 10_000, output: 100, cacheRead: 5_000 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncFullChannelHistory(session.id, cronKey);
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages[1].content).toBe('  喝水时间到\n');
+  expect(session.messages[1].metadata).toMatchObject({
+    customFlag: true,
+    isStreaming: false,
+    isFinal: true,
+    usage: {
+      inputTokens: 10_000,
+      outputTokens: 100,
+      cacheReadTokens: 5_000,
+    },
+    contextPercent: 15,
+    model: 'anthropic/claude-sonnet-4',
+  });
+  expect(messageUpdateSpy).toHaveBeenCalledWith(
+    session.id,
+    'msg-2',
+    '  喝水时间到\n',
+    expect.objectContaining({ isStreaming: false, isFinal: true }),
+  );
+});
+
+test('syncFullChannelHistory: cron active metadata clears stale partial usage', async () => {
+  const cronKey = 'agent:main:cron:report:run:run-active-metadata';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    {
+      id: 'msg-1',
+      type: 'user',
+      content: '生成报告',
+      timestamp: 1,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: cronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+      },
+    },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: '生成中',
+      timestamp: 2,
+      metadata: {
+        usage: { inputTokens: 50_000 },
+        contextPercent: 50,
+        [OpenClawCronRunMetadataKey.SessionKey]: cronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+      },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { status: 'running', model: 'test/model', contextTokens: 100_000 },
+      messages: [
+        { role: 'user', content: '生成报告' },
+        {
+          role: 'assistant',
+          content: '生成中',
+          model: 'test/model',
+          usage: { input: 60_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncFullChannelHistory(session.id, cronKey);
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages[1].metadata).toMatchObject({ isStreaming: true, isFinal: false });
+  expect(session.messages[1].metadata).not.toHaveProperty('usage');
+  expect(session.messages[1].metadata).not.toHaveProperty('contextPercent');
+});
+
+test('syncFullChannelHistory: cron entry index updates partial text without duplicating the run', async () => {
+  const cronKey = 'agent:main:cron:report:run:run-1';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    {
+      id: 'msg-1',
+      type: 'user',
+      content: '生成报告',
+      timestamp: 1,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: cronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+      },
+    },
+    {
+      id: 'msg-2',
+      type: 'assistant',
+      content: '报告生成中…',
+      timestamp: 2,
+      metadata: {
+        customFlag: true,
+        [OpenClawCronRunMetadataKey.SessionKey]: cronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+      },
+    },
+    { id: 'msg-3', type: 'assistant', content: '报告已完成。', timestamp: 3, metadata: {} },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { contextTokens: 100_000, model: 'test/model' },
+      messages: [
+        { role: 'user', content: '生成报告' },
+        {
+          role: 'assistant',
+          content: '报告已完成。',
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncFullChannelHistory(session.id, cronKey);
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages.find((message) => message.id === 'msg-2')).toMatchObject({
+    content: '报告已完成。',
+    metadata: {
+      customFlag: true,
+      usage: { inputTokens: 10_000, outputTokens: 100 },
+      contextPercent: 10,
+    },
+  });
+  expect(session.messages.filter((message) => (
+    message.type === 'assistant' && message.content === '报告已完成。'
+  ))).toHaveLength(2);
 });
 
 test('syncFullChannelHistory: cron run history appends a later run without replacing prior runs', async () => {
@@ -8564,6 +11817,170 @@ test('syncFullChannelHistory: cron run history appends a later run without repla
   ]);
 });
 
+test('syncFullChannelHistory: active cron run repairs its untagged partial beside an older run', async () => {
+  const oldCronKey = 'agent:main:cron:report:run:run-old';
+  const newCronKey = 'agent:main:cron:report:run:run-current';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    {
+      id: 'old-user',
+      type: 'user',
+      content: 'Generate report',
+      timestamp: 1,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: oldCronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+      },
+    },
+    {
+      id: 'old-assistant',
+      type: 'assistant',
+      content: 'Old report',
+      timestamp: 2,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: oldCronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+      },
+    },
+    { id: 'current-user', type: 'user', content: 'Generate report', timestamp: 3, metadata: {} },
+    {
+      id: 'current-assistant',
+      type: 'assistant',
+      content: 'Generating…',
+      timestamp: 4,
+      metadata: { customFlag: true, isStreaming: false, isFinal: true },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const turn = createActiveTurn(session.id, newCronKey, 'run-current');
+  turn.assistantMessageId = 'current-assistant';
+  turn.gatewaySyncedUserMessageIds = new Set(['current-user']);
+  adapter.activeTurns.set(session.id, turn);
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { status: 'done', model: 'test/model', contextTokens: 100_000 },
+      messages: [
+        { role: 'user', content: 'Generate report' },
+        {
+          role: 'assistant',
+          content: 'Final report',
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncFullChannelHistory(session.id, newCronKey);
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages.filter(message => message.type === 'user')).toHaveLength(2);
+  expect(session.messages.filter(message => message.type === 'assistant')).toHaveLength(2);
+  expect(session.messages.find(message => message.id === 'current-assistant')).toMatchObject({
+    content: 'Final report',
+    metadata: {
+      customFlag: true,
+      usage: { inputTokens: 10_000, outputTokens: 100 },
+      contextPercent: 10,
+      [OpenClawCronRunMetadataKey.SessionKey]: newCronKey,
+      [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+    },
+  });
+});
+
+test('syncFullChannelHistory: lagging cron user never consumes an ordinary follow-up', async () => {
+  const oldCronKey = 'agent:main:cron:report:run:run-old';
+  const newCronKey = 'agent:main:cron:report:run:run-lagging-user';
+  const { session, store, getReplaceCallCount } = createReconcileStore([
+    {
+      id: 'old-user',
+      type: 'user',
+      content: 'Generate report',
+      timestamp: 1,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: oldCronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+      },
+    },
+    {
+      id: 'old-assistant',
+      type: 'assistant',
+      content: 'Old report',
+      timestamp: 2,
+      metadata: {
+        [OpenClawCronRunMetadataKey.SessionKey]: oldCronKey,
+        [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+      },
+    },
+    { id: 'follow-up-user', type: 'user', content: 'Generate report', timestamp: 3, metadata: {} },
+    { id: 'follow-up-assistant', type: 'assistant', content: 'OK', timestamp: 4, metadata: { customFollowUp: true } },
+    {
+      id: 'current-assistant',
+      type: 'assistant',
+      content: 'Working…',
+      timestamp: 5,
+      metadata: { currentRunFlag: true, isStreaming: false, isFinal: true },
+    },
+  ]);
+  const adapter = new OpenClawRuntimeAdapter(store, {});
+  const turn = createActiveTurn(session.id, newCronKey, 'run-lagging-user');
+  turn.assistantMessageId = 'current-assistant';
+  adapter.activeTurns.set(session.id, turn);
+  adapter.gatewayClient = {
+    start: () => {},
+    stop: () => {},
+    request: async () => ({
+      sessionInfo: { status: 'done', model: 'test/model', contextTokens: 100_000 },
+      messages: [
+        { role: 'user', content: 'Generate report', timestamp: 6 },
+        {
+          role: 'assistant',
+          content: 'OK',
+          timestamp: 7,
+          model: 'test/model',
+          usage: { input: 10_000, output: 100 },
+        },
+      ],
+    }),
+  };
+
+  await adapter.syncFullChannelHistory(session.id, newCronKey);
+
+  expect(getReplaceCallCount()).toBe(0);
+  expect(session.messages.find(message => message.id === 'follow-up-user')).toMatchObject({
+    content: 'Generate report',
+    metadata: {},
+  });
+  expect(session.messages.find(message => message.id === 'follow-up-assistant')).toMatchObject({
+    content: 'OK',
+    metadata: { customFollowUp: true },
+  });
+  const currentAssistantIndex = session.messages.findIndex(
+    message => message.id === 'current-assistant',
+  );
+  expect(session.messages[currentAssistantIndex - 1]).toMatchObject({
+    type: 'user',
+    content: 'Generate report',
+    timestamp: 6,
+    metadata: {
+      [OpenClawCronRunMetadataKey.SessionKey]: newCronKey,
+      [OpenClawCronRunMetadataKey.EntryIndex]: 0,
+    },
+  });
+  expect(session.messages[currentAssistantIndex]).toMatchObject({
+    content: 'OK',
+    metadata: {
+      currentRunFlag: true,
+      usage: { inputTokens: 10_000, outputTokens: 100 },
+      contextPercent: 10,
+      [OpenClawCronRunMetadataKey.SessionKey]: newCronKey,
+      [OpenClawCronRunMetadataKey.EntryIndex]: 1,
+    },
+  });
+  expect(session.messages.filter(message => message.type === 'assistant')).toHaveLength(3);
+});
+
 test('prefetchChannelUserMessages also consumes existing reminder history backlog', async () => {
   const { session, store } = createHistoryStore([
     { id: 'msg-1', type: 'user', content: 'old user', timestamp: 1, metadata: {} },
@@ -8598,6 +12015,7 @@ test('prefetchChannelUserMessages also consumes existing reminder history backlo
 
 test('prefetchChannelUserMessages uses latest user only for recreated channel sessions', async () => {
   const { session, store, getReplaceCallCount } = createReconcileStore([]);
+  const sessionKey = 'agent:main:feishu:feishu-bot-1:direct:ou_zhangsan';
   const historyMessages = [
     { role: 'user', content: 'old user' },
     { role: 'assistant', content: 'old assistant' },
@@ -8611,10 +12029,12 @@ test('prefetchChannelUserMessages uses latest user only for recreated channel se
     request: async () => ({ messages: historyMessages }),
   };
   adapter.reCreatedChannelSessionIds.add(session.id);
+  const turn = createActiveTurn(session.id, sessionKey, 'run-prefetch-user-id');
+  adapter.activeTurns.set(session.id, turn);
 
   await adapter.prefetchChannelUserMessages(
     session.id,
-    'agent:main:feishu:feishu-bot-1:direct:ou_zhangsan',
+    sessionKey,
   );
 
   expect(getReplaceCallCount()).toBe(0);
@@ -8624,6 +12044,8 @@ test('prefetchChannelUserMessages uses latest user only for recreated channel se
   expect(session.messages.some((message) => message.content === 'old user')).toBe(false);
   expect(adapter.channelSyncCursor.get(session.id)).toBe(3);
   expect(adapter.gatewayHistoryCountBySession.get(session.id)).toBe(historyMessages.length);
+  const syncedUser = session.messages.find(message => message.type === 'user');
+  expect(turn.gatewaySyncedUserMessageIds).toEqual(new Set([syncedUser?.id]));
 });
 
 test('onSessionDeleted deletes gateway transcripts for all session keys', async () => {
@@ -8646,6 +12068,22 @@ test('onSessionDeleted deletes gateway transcripts for all session keys', async 
   } as never;
   adapter.sessionIdBySessionKey.set(channelSessionKey, 'session-1');
   adapter.sessionIdBySessionKey.set(managedSessionKey, 'session-1');
+  const contextCache = (adapter as unknown as {
+    sessionContextTokensCache: Map<string, number>;
+  }).sessionContextTokensCache;
+  const timerState = adapter as unknown as {
+    scheduleUsageMetadataSync: (
+      sessionId: string,
+      sessionKey: string,
+      assistantMessageId: string,
+      delayMs: number,
+      retryIndex: number,
+    ) => void;
+    usageMetadataSyncTimers: Map<string, ReturnType<typeof setTimeout>>;
+  };
+  contextCache.set(channelSessionKey, 128_000);
+  contextCache.set(managedSessionKey, 256_000);
+  timerState.scheduleUsageMetadataSync('session-1', managedSessionKey, 'msg-2', 60_000, 0);
 
   adapter.onSessionDeleted('session-1');
 
@@ -8664,6 +12102,9 @@ test('onSessionDeleted deletes gateway transcripts for all session keys', async 
   });
   expect(adapter.deletedChannelKeys.has(channelSessionKey)).toBe(true);
   expect(adapter.deletedChannelKeys.has(managedSessionKey)).toBe(false);
+  expect(contextCache.has(channelSessionKey)).toBe(false);
+  expect(contextCache.has(managedSessionKey)).toBe(false);
+  expect(timerState.usageMetadataSyncTimers.size).toBe(0);
 });
 
 test('child lifecycle end marks matching subagent done before local session resolution', () => {

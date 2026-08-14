@@ -6,7 +6,11 @@ import {
 } from '../../../shared/cowork/goal';
 import { i18nService } from '../../services/i18n';
 import type { CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
-import { formatMessageDateTime } from '../../utils/tokenFormat';
+import {
+  formatExactTokenCount,
+  formatMessageDateTime,
+  formatTokenCount,
+} from '../../utils/tokenFormat';
 import GoalIcon from '../icons/GoalIcon';
 import MessageForkIcon from '../icons/MessageForkIcon';
 import MarkdownContent from '../MarkdownContent';
@@ -18,6 +22,10 @@ import {
   MEDIA_TOKEN_DISPLAY_RE,
   messageMetaClassName,
 } from './messageDisplayUtils';
+import {
+  getMessageUsageDisplay,
+  type MessageUsageDisplay,
+} from './messageUsageDisplay';
 import ProposedPlanBlock from './ProposedPlanBlock';
 import { parseProposedPlanBlock } from './proposedPlanParser';
 
@@ -48,6 +56,140 @@ const ForkButton: React.FC<{
     <MessageForkIcon className="h-4 w-4 text-secondary" />
   </button>
 );
+
+const AssistantMessageFooter: React.FC<{
+  message: CoworkMessage;
+  copyContent: string;
+  goalCompletionLabel: string | null;
+  modelLabel: string | null;
+  usageDisplay: MessageUsageDisplay;
+  visible: boolean;
+  actionsVisible: boolean;
+  onFork?: (messageId: string) => void;
+}> = ({
+  message,
+  copyContent,
+  goalCompletionLabel,
+  modelLabel,
+  usageDisplay,
+  visible,
+  actionsVisible,
+  onFork,
+}) => {
+  const tokenNumberLocale = i18nService.getLanguage() === 'zh' ? 'zh-CN' : 'en-US';
+  const inputTokenLabel = usageDisplay.inputTokens != null
+    ? formatTokenCount(usageDisplay.inputTokens)
+    : null;
+  const outputTokenLabel = usageDisplay.outputTokens != null
+    ? formatTokenCount(usageDisplay.outputTokens)
+    : null;
+  const cacheReadTokenLabel = usageDisplay.cacheReadTokens != null
+    ? formatTokenCount(usageDisplay.cacheReadTokens)
+    : null;
+  const inputAccessibleLabel = usageDisplay.inputTokens != null
+    ? i18nService.t('coworkMessageInputTokens').replace(
+      '{tokens}',
+      formatExactTokenCount(usageDisplay.inputTokens, tokenNumberLocale),
+    )
+    : null;
+  const outputAccessibleLabel = usageDisplay.outputTokens != null
+    ? i18nService.t('coworkMessageOutputTokens').replace(
+      '{tokens}',
+      formatExactTokenCount(usageDisplay.outputTokens, tokenNumberLocale),
+    )
+    : null;
+  const cacheReadAccessibleLabel = usageDisplay.cacheReadTokens != null
+    ? i18nService.t('coworkMessageCacheReadTokens').replace(
+      '{tokens}',
+      formatExactTokenCount(usageDisplay.cacheReadTokens, tokenNumberLocale),
+    )
+    : null;
+  const contextLabel = usageDisplay.contextPercent != null
+    ? i18nService.t('coworkMessageContextShort')
+      .replace('{percent}', String(usageDisplay.contextPercent))
+    : null;
+  const contextAccessibleLabel = usageDisplay.contextPercent != null
+    ? i18nService.t('coworkContextUsagePercent')
+      .replace('{percent}', String(usageDisplay.contextPercent))
+    : null;
+
+  return (
+    <div
+      className={`${messageMetaClassName(visible)} min-w-0 max-w-full flex-wrap gap-y-1 !text-secondary`}
+      aria-hidden={!visible}
+      data-cowork-message-footer="true"
+      data-cowork-search-exclude="true"
+    >
+      {goalCompletionLabel && (
+        <span className="inline-flex items-center gap-1 text-secondary">
+          <GoalIcon className="h-3.5 w-3.5" />
+          <span>{goalCompletionLabel}</span>
+        </span>
+      )}
+      <span className="shrink-0 whitespace-nowrap">{formatMessageDateTime(message.timestamp)}</span>
+      {inputTokenLabel != null && (
+        <span className="shrink-0 whitespace-nowrap" title={inputAccessibleLabel ?? undefined}>
+          <span aria-hidden="true">
+            {i18nService.t('coworkMessageInputTokensShort').replace('{tokens}', inputTokenLabel)}
+          </span>
+          <span className="sr-only">{inputAccessibleLabel}</span>
+        </span>
+      )}
+      {outputTokenLabel != null && (
+        <span className="shrink-0 whitespace-nowrap" title={outputAccessibleLabel ?? undefined}>
+          <span aria-hidden="true">
+            {i18nService.t('coworkMessageOutputTokensShort').replace('{tokens}', outputTokenLabel)}
+          </span>
+          <span className="sr-only">{outputAccessibleLabel}</span>
+        </span>
+      )}
+      {cacheReadTokenLabel != null && (
+        <span className="shrink-0 whitespace-nowrap" title={cacheReadAccessibleLabel ?? undefined}>
+          <span aria-hidden="true">
+            {i18nService.t('coworkMessageCacheReadTokensShort').replace('{tokens}', cacheReadTokenLabel)}
+          </span>
+          <span className="sr-only">{cacheReadAccessibleLabel}</span>
+        </span>
+      )}
+      {contextLabel != null && (
+        <span
+          className={`shrink-0 whitespace-nowrap ${usageDisplay.contextClassName}`}
+          title={contextAccessibleLabel ?? undefined}
+        >
+          <span aria-hidden="true">{contextLabel}</span>
+          <span className="sr-only">{contextAccessibleLabel}</span>
+        </span>
+      )}
+      {modelLabel && (
+        <span className="min-w-0 max-w-full truncate" title={modelLabel}>
+          {modelLabel}
+        </span>
+      )}
+      <span className="inline-flex shrink-0 items-center gap-2" aria-hidden={!actionsVisible}>
+        {onFork && (
+          <ForkButton
+            message={message}
+            visible={actionsVisible}
+            onFork={() => onFork(message.id)}
+          />
+        )}
+        <MessageCopyButton
+          content={copyContent}
+          onCopy={(result) => reportConversationMessageAction({
+            actionType: 'copy_message',
+            message,
+            params: {
+              result,
+              copySource: 'assistant_message',
+              copiedLength: copyContent.length,
+            },
+          })}
+          visible={actionsVisible}
+        />
+      </span>
+    </div>
+  );
+};
 
 // ── AssistantMessageItem ─────────────────────────────────────────────────────
 
@@ -86,13 +228,14 @@ const AssistantMessageItem: React.FC<{
     proposedPlan.planText,
   ].filter((part): part is string => Boolean(part)).join('\n\n');
   const modelLabel = getMessageModelLabel(turnMetadata);
+  const usageDisplay = getMessageUsageDisplay(turnMetadata);
   const goalCompletionDuration = completedGoal
     ? formatCoworkGoalCompletionDuration(completedGoal)
     : null;
   const goalCompletionLabel = goalCompletionDuration
     ? i18nService.t('coworkGoalCompletedIn').replace('{duration}', goalCompletionDuration)
     : null;
-  const metaVisible = isHovered || !!goalCompletionLabel;
+  const metaVisible = isHovered || !!goalCompletionLabel || usageDisplay.hasVisibleStats;
   const showPlanConfirmationActions = planConfirmationMessageId === message.id;
   const handleImageClick = useCallback((image: ImagePreviewSource) => {
     reportConversationMessageAction({
@@ -131,6 +274,18 @@ const AssistantMessageItem: React.FC<{
     }
     setIsHovered(false);
   }, []);
+  const messageFooter = showCopyButton ? (
+    <AssistantMessageFooter
+      message={message}
+      copyContent={copyContent}
+      goalCompletionLabel={goalCompletionLabel}
+      modelLabel={modelLabel}
+      usageDisplay={usageDisplay}
+      visible={metaVisible}
+      actionsVisible={isHovered}
+      onFork={onFork}
+    />
+  ) : null;
 
   return (
     <div
@@ -153,42 +308,6 @@ const AssistantMessageItem: React.FC<{
               forceExpanded={forceSearchExpanded}
               onImageClick={handleImageClick}
             />
-            {showCopyButton && (
-              <div
-                className={messageMetaClassName(metaVisible)}
-                aria-hidden={!metaVisible}
-                data-cowork-search-exclude="true"
-              >
-                {goalCompletionLabel && (
-                  <span className="inline-flex items-center gap-1 text-secondary">
-                    <GoalIcon className="h-3.5 w-3.5" />
-                    <span>{goalCompletionLabel}</span>
-                  </span>
-                )}
-                <span>{formatMessageDateTime(message.timestamp)}</span>
-                {modelLabel && <span>{modelLabel}</span>}
-                {onFork && (
-                  <ForkButton
-                    message={message}
-                    visible={isHovered}
-                    onFork={() => onFork(message.id)}
-                  />
-                )}
-                <MessageCopyButton
-                  content={copyContent}
-                  onCopy={(result) => reportConversationMessageAction({
-                    actionType: 'copy_message',
-                    message,
-                    params: {
-                      result,
-                      copySource: 'assistant_message',
-                      copiedLength: copyContent.length,
-                    },
-                  })}
-                  visible={isHovered}
-                />
-              </div>
-            )}
           </div>
         )}
         {proposedPlan.planText && (
@@ -205,42 +324,7 @@ const AssistantMessageItem: React.FC<{
           </div>
         )}
       </div>
-      {showCopyButton && !displayContent && (
-        <div
-          className={messageMetaClassName(metaVisible)}
-          aria-hidden={!metaVisible}
-          data-cowork-search-exclude="true"
-        >
-          {goalCompletionLabel && (
-            <span className="inline-flex items-center gap-1 text-secondary">
-              <GoalIcon className="h-3.5 w-3.5" />
-              <span>{goalCompletionLabel}</span>
-            </span>
-          )}
-          <span>{formatMessageDateTime(message.timestamp)}</span>
-          {modelLabel && <span>{modelLabel}</span>}
-          {onFork && (
-            <ForkButton
-              message={message}
-              visible={isHovered}
-              onFork={() => onFork(message.id)}
-            />
-          )}
-          <MessageCopyButton
-            content={copyContent}
-            onCopy={(result) => reportConversationMessageAction({
-              actionType: 'copy_message',
-              message,
-              params: {
-                result,
-                copySource: 'assistant_message',
-                copiedLength: copyContent.length,
-              },
-            })}
-            visible={isHovered}
-          />
-        </div>
-      )}
+      {messageFooter}
       <ImagePreviewModal image={expandedImage} onClose={() => setExpandedImage(null)} />
     </div>
   );

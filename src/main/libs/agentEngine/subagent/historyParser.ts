@@ -2,7 +2,12 @@ import crypto from 'node:crypto';
 
 import type { CoworkMessage } from '../../../coworkStore';
 import {
+  calculateGatewayContextPercent,
+  extractGatewayAssistantTurnUsages,
   extractGatewayMessageText,
+  normalizeGatewayHistoryModel,
+  normalizeGatewayModelIdentity,
+  normalizeGatewayUsage,
   shouldSuppressHeartbeatText,
 } from '../../openclawHistory';
 
@@ -11,6 +16,9 @@ export type SubagentCoworkMessage = CoworkMessage;
 export interface ParseSubagentGatewayHistoryOptions {
   createId?: () => string;
   startTimestamp?: number;
+  contextTokens?: number;
+  sessionModel?: string;
+  latestTurnActive?: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
@@ -220,6 +228,58 @@ export const parseSubagentGatewayHistoryMessages = (
   const createId = options.createId ?? (() => crypto.randomUUID());
   let timestamp = options.startTimestamp ?? Date.now() - historyMessages.length * 1000;
   const messages: SubagentCoworkMessage[] = [];
+  const assistantTurns = extractGatewayAssistantTurnUsages(historyMessages);
+  const turnByTargetAssistantIndex = new Map(
+    assistantTurns
+      .filter(turn => turn.targetAssistantIndex != null)
+      .map(turn => [turn.targetAssistantIndex as number, turn]),
+  );
+  const latestTargetAssistantIndex = assistantTurns.at(-1)?.targetAssistantIndex;
+  const sessionModel = normalizeGatewayHistoryModel(options.sessionModel);
+  const contextTokens = typeof options.contextTokens === 'number'
+    && Number.isFinite(options.contextTokens)
+    && options.contextTokens > 0
+    ? options.contextTokens
+    : undefined;
+  const buildAssistantMetadata = (
+    rawIndex: number,
+    raw: Record<string, unknown>,
+  ): NonNullable<CoworkMessage['metadata']> => {
+    const turn = turnByTargetAssistantIndex.get(rawIndex);
+    const targetCallUsage = normalizeGatewayUsage(raw.usage);
+    const hasTargetCallUsage = targetCallUsage?.input != null
+      || targetCallUsage?.output != null
+      || targetCallUsage?.cacheRead != null
+      || targetCallUsage?.cacheWrite != null;
+    const usage = hasTargetCallUsage ? turn?.usage : undefined;
+    const rawModel = turn?.model
+      ?? (rawIndex === latestTargetAssistantIndex ? sessionModel : undefined);
+    const model = normalizeGatewayModelIdentity(
+      rawModel,
+      turn?.modelProvider,
+    )?.ref ?? rawModel;
+    const isActiveLatestTurn = rawIndex === latestTargetAssistantIndex
+      && options.latestTurnActive === true;
+    const finalUsage = isActiveLatestTurn ? undefined : usage;
+    const contextPercent = rawIndex === latestTargetAssistantIndex && !isActiveLatestTurn
+      ? calculateGatewayContextPercent(finalUsage, contextTokens)
+      : undefined;
+
+    return {
+      isStreaming: isActiveLatestTurn,
+      isFinal: !isActiveLatestTurn,
+      ...(finalUsage ? {
+        usage: {
+          ...(finalUsage.input != null && { inputTokens: finalUsage.input }),
+          ...(finalUsage.output != null && { outputTokens: finalUsage.output }),
+          ...(finalUsage.cacheRead != null && { cacheReadTokens: finalUsage.cacheRead }),
+          ...(finalUsage.cacheWrite != null && { cacheWriteTokens: finalUsage.cacheWrite }),
+        },
+      } : {}),
+      ...(contextPercent != null && { contextPercent }),
+      ...(model && { model }),
+    };
+  };
   const rawTimestampOffsets = new WeakMap<Record<string, unknown>, number>();
   const nextTimestamp = (raw?: Record<string, unknown>): number => {
     const parsed = raw ? getHistoryMessageTimestamp(raw) : undefined;
@@ -233,7 +293,8 @@ export const parseSubagentGatewayHistoryMessages = (
     return timestamp++;
   };
 
-  for (const raw of historyMessages) {
+  for (let rawIndex = 0; rawIndex < historyMessages.length; rawIndex += 1) {
+    const raw = historyMessages[rawIndex];
     if (!isRecord(raw)) continue;
     const role = typeof raw.role === 'string' ? raw.role.trim().toLowerCase() : '';
 
@@ -247,6 +308,7 @@ export const parseSubagentGatewayHistoryMessages = (
             type: 'assistant',
             content: text,
             timestamp: nextTimestamp(raw),
+            metadata: buildAssistantMetadata(rawIndex, raw),
           });
         }
         for (const block of collectToolCallBlocks(raw)) {
@@ -324,6 +386,7 @@ export const parseSubagentGatewayHistoryMessages = (
             type: 'assistant',
             content: block.text.trim(),
             timestamp: nextTimestamp(raw),
+            metadata: buildAssistantMetadata(rawIndex, raw),
           });
         }
       }

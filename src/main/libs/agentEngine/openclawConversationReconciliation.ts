@@ -65,10 +65,6 @@ export const isSameReconciledEntry = (
     && getLocalMediaAttachmentsKey(left.metadata) === getLocalMediaAttachmentsKey(right.metadata);
 };
 
-const historyEntryKey = (entry: { role: 'user' | 'assistant'; text: string }): string => {
-  return `${entry.role}\x1f${entry.text}`;
-};
-
 const isValidMessageTimestamp = (value: unknown): value is number => {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;
 };
@@ -77,23 +73,260 @@ export const applyLocalTimestampsToEntries = (
   entries: ReconciledConversationEntry[],
   localEntries: Array<{ role: 'user' | 'assistant'; text: string; timestamp?: number }>,
 ): ReconciledConversationEntry[] => {
-  const localTimestamps = new Map<string, number[]>();
-  for (const entry of localEntries) {
-    if (!isValidMessageTimestamp(entry.timestamp)) continue;
-    const key = historyEntryKey(entry);
-    const timestamps = localTimestamps.get(key) ?? [];
-    timestamps.push(entry.timestamp);
-    localTimestamps.set(key, timestamps);
-  }
-
-  return entries.map((entry) => {
+  const matches = buildTurnScopedMetadataMatches(entries, localEntries);
+  return entries.map((entry, index) => {
     if (isValidMessageTimestamp(entry.timestamp)) {
       return entry;
     }
-    const timestamps = localTimestamps.get(historyEntryKey(entry));
-    const timestamp = timestamps?.shift();
+    const localIndex = matches.get(index);
+    const timestamp = localIndex == null ? undefined : localEntries[localIndex]?.timestamp;
     return timestamp != null ? { ...entry, timestamp } : entry;
   });
+};
+
+type IndexedConversationTurn = {
+  userIndex: number;
+  assistantIndexes: number[];
+};
+
+const buildIndexedConversationTurns = (
+  entries: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>,
+): { leadingAssistantIndexes: number[]; turns: IndexedConversationTurn[] } => {
+  const leadingAssistantIndexes: number[] = [];
+  const turns: IndexedConversationTurn[] = [];
+  let currentTurn: IndexedConversationTurn | undefined;
+  for (let index = 0; index < entries.length; index += 1) {
+    if (entries[index].role === 'user') {
+      currentTurn = { userIndex: index, assistantIndexes: [] };
+      turns.push(currentTurn);
+    } else if (currentTurn) {
+      currentTurn.assistantIndexes.push(index);
+    } else {
+      leadingAssistantIndexes.push(index);
+    }
+  }
+  return { leadingAssistantIndexes, turns };
+};
+
+const findLinearUserTurnAlignment = (
+  authoritativeTurns: IndexedConversationTurn[],
+  authoritativeEntries: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>,
+  localTurns: IndexedConversationTurn[],
+  localEntries: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>,
+): { authoritativeStart: number; localStart: number; length: number } | null => {
+  const authoritativeTexts = authoritativeTurns.map(turn => authoritativeEntries[turn.userIndex].text);
+  const localTexts = localTurns.map(turn => localEntries[turn.userIndex].text);
+  const matchesAt = (
+    authoritativeStart: number,
+    localStart: number,
+    length: number,
+  ): boolean => {
+    for (let offset = 0; offset < length; offset += 1) {
+      if (authoritativeTexts[authoritativeStart + offset] !== localTexts[localStart + offset]) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  if (authoritativeTexts.length === 0 || localTexts.length === 0) return null;
+  if (
+    authoritativeTexts.length === localTexts.length
+    && matchesAt(0, 0, authoritativeTexts.length)
+  ) {
+    return { authoritativeStart: 0, localStart: 0, length: authoritativeTexts.length };
+  }
+  if (localTexts.length < authoritativeTexts.length) {
+    const authoritativeStart = authoritativeTexts.length - localTexts.length;
+    const prefixMatches = matchesAt(0, 0, localTexts.length);
+    const suffixMatches = matchesAt(authoritativeStart, 0, localTexts.length);
+    if (prefixMatches && suffixMatches && authoritativeStart !== 0) return null;
+    if (prefixMatches) {
+      return { authoritativeStart: 0, localStart: 0, length: localTexts.length };
+    }
+    if (suffixMatches) {
+      return { authoritativeStart, localStart: 0, length: localTexts.length };
+    }
+  } else if (authoritativeTexts.length < localTexts.length) {
+    const localStart = localTexts.length - authoritativeTexts.length;
+    const prefixMatches = matchesAt(0, 0, authoritativeTexts.length);
+    const suffixMatches = matchesAt(0, localStart, authoritativeTexts.length);
+    if (prefixMatches && suffixMatches && localStart !== 0) return null;
+    if (prefixMatches) {
+      return { authoritativeStart: 0, localStart: 0, length: authoritativeTexts.length };
+    }
+    if (suffixMatches) {
+      return { authoritativeStart: 0, localStart, length: authoritativeTexts.length };
+    }
+  }
+  return null;
+};
+
+const pairAssistantIndexesWithinTurn = (
+  authoritativeIndexes: number[],
+  authoritativeEntries: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>,
+  localIndexes: number[],
+  localEntries: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }>,
+  matches: Map<number, number>,
+): void => {
+  if (authoritativeIndexes.length === localIndexes.length) {
+    for (let index = 0; index < authoritativeIndexes.length; index += 1) {
+      matches.set(authoritativeIndexes[index], localIndexes[index]);
+    }
+    return;
+  }
+
+  const usedLocalIndexes = new Set<number>();
+  let localSearchOffset = localIndexes.length - 1;
+  for (let offset = authoritativeIndexes.length - 1; offset >= 0; offset -= 1) {
+    const authoritativeIndex = authoritativeIndexes[offset];
+    for (let localOffset = localSearchOffset; localOffset >= 0; localOffset -= 1) {
+      const localIndex = localIndexes[localOffset];
+      if (authoritativeEntries[authoritativeIndex].text === localEntries[localIndex].text) {
+        matches.set(authoritativeIndex, localIndex);
+        usedLocalIndexes.add(localIndex);
+        localSearchOffset = localOffset - 1;
+        break;
+      }
+    }
+  }
+
+  const remainingAuthoritative = authoritativeIndexes.filter(index => !matches.has(index));
+  const remainingLocal = localIndexes.filter(index => !usedLocalIndexes.has(index));
+  let authoritativeOffset = remainingAuthoritative.length - 1;
+  let localOffset = remainingLocal.length - 1;
+  while (authoritativeOffset >= 0 && localOffset >= 0) {
+    matches.set(remainingAuthoritative[authoritativeOffset], remainingLocal[localOffset]);
+    authoritativeOffset -= 1;
+    localOffset -= 1;
+  }
+};
+
+const buildTurnScopedMetadataMatches = (
+  entries: ReconciledConversationEntry[],
+  localEntries: ReadonlyArray<{
+    role: 'user' | 'assistant';
+    text: string;
+    metadata?: Record<string, unknown>;
+  }>,
+): Map<number, number> => {
+  const matches = new Map<number, number>();
+  const authoritative = buildIndexedConversationTurns(entries);
+  const local = buildIndexedConversationTurns(localEntries);
+  const alignment = findLinearUserTurnAlignment(
+    authoritative.turns,
+    entries,
+    local.turns,
+    localEntries,
+  );
+  if (alignment) {
+    for (let offset = 0; offset < alignment.length; offset += 1) {
+      const authoritativeTurn = authoritative.turns[alignment.authoritativeStart + offset];
+      const localTurn = local.turns[alignment.localStart + offset];
+      matches.set(authoritativeTurn.userIndex, localTurn.userIndex);
+      pairAssistantIndexesWithinTurn(
+        authoritativeTurn.assistantIndexes,
+        entries,
+        localTurn.assistantIndexes,
+        localEntries,
+        matches,
+      );
+    }
+  }
+
+  if (
+    local.turns.length === 0
+    && authoritative.turns.length === 1
+    && local.leadingAssistantIndexes.length > 0
+  ) {
+    pairAssistantIndexesWithinTurn(
+      authoritative.turns[0].assistantIndexes,
+      entries,
+      local.leadingAssistantIndexes,
+      localEntries,
+      matches,
+    );
+  }
+
+  // A bounded history tail can begin with assistant messages before its first
+  // user anchor. Preserve metadata there only for exact, ordered text matches.
+  let localOffset = local.leadingAssistantIndexes.length - 1;
+  for (let offset = authoritative.leadingAssistantIndexes.length - 1; offset >= 0; offset -= 1) {
+    const authoritativeIndex = authoritative.leadingAssistantIndexes[offset];
+    for (; localOffset >= 0; localOffset -= 1) {
+      const localIndex = local.leadingAssistantIndexes[localOffset];
+      if (entries[authoritativeIndex].text === localEntries[localIndex].text) {
+        matches.set(authoritativeIndex, localIndex);
+        localOffset -= 1;
+        break;
+      }
+    }
+  }
+  return matches;
+};
+
+/**
+ * Preserve local-only metadata when an authoritative history window replaces
+ * matching conversation entries. Matching is scoped to aligned user turns so
+ * repeated assistant text cannot move usage/custom metadata across turns;
+ * gateway usage/model fields remain authoritative and nested usage values are
+ * merged field by field.
+ */
+export const mergeLocalMetadataIntoEntries = (
+  entries: ReconciledConversationEntry[],
+  localEntries: Array<{
+    role: 'user' | 'assistant';
+    text: string;
+    metadata?: Record<string, unknown>;
+  }>,
+): ReconciledConversationEntry[] => {
+  const result = entries.map(entry => ({ ...entry }));
+  const metadataMatches = buildTurnScopedMetadataMatches(entries, localEntries);
+
+  for (let entryIndex = result.length - 1; entryIndex >= 0; entryIndex -= 1) {
+    const entry = result[entryIndex];
+    const matchingLocalIndex = metadataMatches.get(entryIndex);
+    if (matchingLocalIndex == null) continue;
+
+    const localMetadata = localEntries[matchingLocalIndex].metadata;
+    const authoritativeMetadata = entry.metadata;
+    const hasLocalMetadata = Boolean(localMetadata && Object.keys(localMetadata).length > 0);
+    const hasAuthoritativeMetadata = Boolean(
+      authoritativeMetadata && Object.keys(authoritativeMetadata).length > 0,
+    );
+    if (hasLocalMetadata || hasAuthoritativeMetadata) {
+      const localUsage = isRecord(localMetadata?.usage) ? localMetadata.usage : undefined;
+      const authoritativeUsage = isRecord(authoritativeMetadata?.usage)
+        ? authoritativeMetadata.usage
+        : undefined;
+      const authoritativeTurnIsActive = authoritativeMetadata?.isStreaming === true
+        || authoritativeMetadata?.isFinal === false;
+      const metadata: Record<string, unknown> = {
+        ...(localMetadata ?? {}),
+        ...(authoritativeMetadata ?? {}),
+        ...(localUsage || authoritativeUsage ? {
+          usage: {
+            ...(localUsage ?? {}),
+            ...(authoritativeUsage ?? {}),
+          },
+        } : {}),
+        ...(entry.role === 'assistant' ? {
+          isStreaming: authoritativeTurnIsActive,
+          isFinal: !authoritativeTurnIsActive,
+        } : {}),
+      };
+      if (authoritativeTurnIsActive) {
+        delete metadata.usage;
+        delete metadata.contextPercent;
+      }
+      result[entryIndex] = {
+        ...entry,
+        metadata,
+      };
+    }
+  }
+
+  return result;
 };
 
 /**
@@ -142,9 +375,12 @@ export const findTailAlignment = (
     }
   }
 
-  if (authUsers.length === 0 || localUsers.length === 0) {
-    return { localIdx: 0, authIdx: 0 };
-  }
+  // A non-empty assistant-only gateway window can be a byte/count-bounded
+  // middle of a turn. If its text does not overlap the local suffix, there is
+  // no evidence that it is a complete replacement for the local conversation.
+  // Keep this distinct from the valid 0/0 alignment returned for an empty
+  // local conversation so the caller can safely skip a destructive replace.
+  if (authUsers.length === 0 || localUsers.length === 0) return null;
 
   const maxK = Math.min(localUsers.length, authUsers.length);
   for (let k = maxK; k >= 1; k--) {

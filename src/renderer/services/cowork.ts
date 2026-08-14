@@ -92,6 +92,29 @@ import { i18nService } from './i18n';
 
 const STREAM_ERROR_DUPLICATE_WINDOW_MS = 10_000;
 
+export const describeFinalMessageMetadata = (
+  metadata: Record<string, unknown> | null | undefined,
+): string | null => {
+  if (metadata?.isFinal !== true) return null;
+  const rawUsage = metadata.usage;
+  const usage = rawUsage && typeof rawUsage === 'object' && !Array.isArray(rawUsage)
+    ? rawUsage as Record<string, unknown>
+    : undefined;
+  const diagnosticFields = [
+    usage?.inputTokens != null ? 'input' : '',
+    usage?.outputTokens != null ? 'output' : '',
+    usage?.cacheReadTokens != null ? 'cacheRead' : '',
+    usage?.cacheWriteTokens != null ? 'cacheWrite' : '',
+    metadata.contextPercent != null ? 'context' : '',
+    typeof metadata.model === 'string' && metadata.model.trim() ? 'model' : '',
+  ].filter(Boolean);
+  if (diagnosticFields.length === 0) return null;
+  const model = typeof metadata.model === 'string' && metadata.model.trim()
+    ? metadata.model.trim()
+    : 'none';
+  return `fields=${diagnosticFields.join(',')}; model=${model}.`;
+};
+
 const classifyError = (error: string): string => {
   const key = classifyErrorKey(error);
   return key ? i18nService.t(key) : error;
@@ -186,7 +209,13 @@ class CoworkService {
     const persistedMessage = error === undefined
       ? message
       : `${message} error=${error instanceof Error ? error.message : String(error)}`;
-    window.electron?.log?.fromRenderer?.(level, 'CoworkService', persistedMessage);
+    try {
+      window.electron?.log?.fromRenderer?.(level, 'CoworkService', persistedMessage);
+    } catch (logError) {
+      // Persisted renderer diagnostics are best-effort and must never interrupt
+      // message delivery or Redux updates.
+      console.debug('[CoworkService] failed to persist renderer diagnostic.', logError);
+    }
   }
 
   private setCurrentSessionStreaming(sessionId: string, isStreaming: boolean, reason: string): void {
@@ -276,10 +305,11 @@ class CoworkService {
         store.dispatch(updateSessionStatus({ sessionId, status: 'running' }));
         this.queuedFollowUpCoordinator.handleSessionRunning(sessionId);
       }
-      if (metadata?.isFinal === true && typeof metadata.model === 'string' && metadata.model.trim()) {
+      const metadataDiagnostic = describeFinalMessageMetadata(metadata);
+      if (metadataDiagnostic) {
         this.logDiagnostic(
           'debug',
-          `received final message metadata for session ${sessionId}, message ${messageId}, model ${metadata.model}`,
+          `received final message metadata for session ${sessionId}, message ${messageId}; ${metadataDiagnostic}`,
         );
       }
       store.dispatch(updateMessageContent({ sessionId, messageId, content, metadata }));

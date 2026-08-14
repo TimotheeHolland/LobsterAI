@@ -52,6 +52,28 @@ export class SubagentMessageStore {
     insertAll();
   }
 
+  /** Atomically update metadata without replacing bounded or local-only history. */
+  updateMessageMetadata(runId: string, messages: Array<{
+    id: string;
+    metadata: Record<string, unknown>;
+  }>): void {
+    if (messages.length === 0) return;
+
+    const updateStmt = this.db.prepare(
+      'UPDATE subagent_messages SET metadata = ? WHERE run_id = ? AND id = ?',
+    );
+    const updateAll = this.db.transaction(() => {
+      for (const message of messages) {
+        updateStmt.run(
+          JSON.stringify(message.metadata),
+          runId,
+          message.id,
+        );
+      }
+    });
+    updateAll();
+  }
+
   /**
    * Read all messages for a subagent run, ordered by sequence.
    */

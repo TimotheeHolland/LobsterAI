@@ -751,7 +751,10 @@ export const buildConversationTurns = (items: DisplayItem[]): ConversationTurn[]
 export const getMessageModelLabel = (metadata?: CoworkMessageMetadata | null): string | null => {
   const model = typeof metadata?.model === 'string' ? metadata.model.trim() : '';
   if (!model) return null;
-  return model.includes('/') ? (model.split('/').pop() || model) : model;
+  const providerSeparatorIndex = model.indexOf('/');
+  return providerSeparatorIndex >= 0
+    ? model.slice(providerSeparatorIndex + 1) || model
+    : model;
 };
 
 export const messageMetaClassName = (visible: boolean, align: 'left' | 'right' = 'left'): string => [

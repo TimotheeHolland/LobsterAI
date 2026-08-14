@@ -2,21 +2,118 @@ import { describe, expect, test } from 'vitest';
 
 import { isInternalCompactionSystemText } from '../../common/coworkSystemMessages';
 import {
+  aggregateGatewayUsage,
   buildScheduledReminderSystemMessage,
+  calculateGatewayContextPercent,
   extractGatewayHistoryEntries,
+  extractGatewayHistoryEntriesWithTurnUsage,
   extractGatewayHistoryEntry,
   extractGatewayMessageText,
   extractGatewayMessageThinking,
+  isGatewaySessionModelCompatible,
   isHeartbeatAckText,
   isHeartbeatPromptText,
   isPreCompactionMemoryFlushPromptText,
   isSilentReplyPrefixText,
   isSilentReplyText,
+  mergeGatewayUsageSnapshots,
+  normalizeGatewayModelIdentity,
+  normalizeGatewayUsage,
+  resolveGatewaySessionInfoContext,
   stripTrailingSilentReplyTail,
   stripTrailingSilentReplyToken,
 } from './openclawHistory';
 
 describe('openclawHistory', () => {
+  test('normalizes provider-aware model identities from full and split refs', () => {
+    expect(normalizeGatewayModelIdentity('anthropic/claude-sonnet-4')).toEqual({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4',
+      ref: 'anthropic/claude-sonnet-4',
+    });
+    expect(normalizeGatewayModelIdentity('claude-sonnet-4', 'anthropic')).toEqual({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4',
+      ref: 'anthropic/claude-sonnet-4',
+    });
+    expect(normalizeGatewayModelIdentity('google/gemini-2.5-flash', 'openrouter')).toEqual({
+      provider: 'openrouter',
+      model: 'google/gemini-2.5-flash',
+      ref: 'openrouter/google/gemini-2.5-flash',
+    });
+  });
+
+  test('requires sessionInfo to prove compatibility with a known target model', () => {
+    expect(isGatewaySessionModelCompatible(
+      'anthropic/claude-sonnet-4',
+      undefined,
+      'claude-sonnet-4',
+      'anthropic',
+    )).toBe(true);
+    expect(isGatewaySessionModelCompatible(
+      'shared-model',
+      'provider-a',
+      'shared-model',
+      'provider-b',
+    )).toBe(false);
+    expect(isGatewaySessionModelCompatible(
+      'shared-model',
+      'provider-a',
+      'shared-model',
+      undefined,
+    )).toBe(false);
+    expect(isGatewaySessionModelCompatible(
+      undefined,
+      undefined,
+      'current-model',
+      'provider-b',
+    )).toBe(false);
+
+    expect(resolveGatewaySessionInfoContext(
+      'shared-model',
+      'provider-a',
+      {
+        model: 'shared-model',
+        modelProvider: 'provider-b',
+        contextTokens: 200_000,
+        hasActiveRun: true,
+      },
+    )).toEqual({
+      applies: false,
+      model: 'shared-model',
+      modelProvider: 'provider-b',
+      hasActiveRun: true,
+      hasActiveExecution: true,
+      hasTerminalExecution: false,
+    });
+  });
+
+  test('detects active session and subagent states without reviving terminal subagent rows', () => {
+    expect(resolveGatewaySessionInfoContext('model', undefined, {
+      model: 'model',
+      status: 'running',
+    }).hasActiveExecution).toBe(true);
+    expect(resolveGatewaySessionInfoContext('model', undefined, {
+      model: 'model',
+      hasActiveSubagentRun: true,
+      subagentRunState: 'active',
+    }).hasActiveExecution).toBe(true);
+    const historical = resolveGatewaySessionInfoContext('model', undefined, {
+      model: 'model',
+      status: 'running',
+      subagentRunState: 'historical',
+    });
+    expect(historical.hasActiveExecution).toBe(false);
+    expect(historical.hasTerminalExecution).toBe(true);
+    const interrupted = resolveGatewaySessionInfoContext('model', undefined, {
+      model: 'model',
+      status: 'running',
+      subagentRunState: 'interrupted',
+    });
+    expect(interrupted.hasActiveExecution).toBe(false);
+    expect(interrupted.hasTerminalExecution).toBe(true);
+  });
+
   test('extracts plain text content blocks', () => {
     expect(
       extractGatewayMessageText({
@@ -66,6 +163,310 @@ describe('openclawHistory', () => {
     ).toEqual({
       role: 'assistant',
       text: 'final answer',
+    });
+  });
+
+  test('normalizes canonical OpenClaw usage including cache writes', () => {
+    expect(normalizeGatewayUsage({
+      input: 29_600,
+      output: 647,
+      cacheRead: 59_400,
+      cacheWrite: 1_024,
+      total: 90_671,
+    })).toEqual({
+      input: 29_600,
+      output: 647,
+      cacheRead: 59_400,
+      cacheWrite: 1_024,
+      totalTokens: 90_671,
+      promptTokens: 90_024,
+    });
+  });
+
+  test('normalizes aliases preserved by OpenClaw v2026.6.1 chat.history', () => {
+    expect(normalizeGatewayUsage({
+      input_tokens: 80_000,
+      completion_tokens: 391,
+      cache_read_input_tokens: 20_000,
+      cache_creation_input_tokens: 2_000,
+      total_tokens: 80_391,
+    })).toEqual({
+      input: 80_000,
+      output: 391,
+      cacheRead: 20_000,
+      cacheWrite: 2_000,
+      totalTokens: 80_391,
+      promptTokens: 102_000,
+    });
+  });
+
+  test('normalizes OpenAI cached prompt totals without double counting cache reads', () => {
+    expect(normalizeGatewayUsage({
+      prompt_tokens: 80_000,
+      completion_tokens: 391,
+      prompt_tokens_details: { cached_tokens: 20_000 },
+    })).toEqual({
+      input: 60_000,
+      output: 391,
+      cacheRead: 20_000,
+      promptTokens: 80_000,
+    });
+  });
+
+  test('uses canonical cache priority when OpenAI cache markers coexist', () => {
+    expect(normalizeGatewayUsage({
+      prompt_tokens: 80_000,
+      cacheRead: 10_000,
+      prompt_tokens_details: { cached_tokens: 20_000 },
+    })).toEqual({
+      input: 70_000,
+      cacheRead: 10_000,
+      promptTokens: 80_000,
+    });
+  });
+
+  test('normalizes llama.cpp timing aliases accepted by OpenClaw v2026.6.1', () => {
+    expect(normalizeGatewayUsage({
+      timings: { prompt_n: 12_000, predicted_n: 300 },
+    })).toEqual({
+      input: 12_000,
+      output: 300,
+      promptTokens: 12_000,
+    });
+  });
+
+  test('calculates v2026.6.1 context usage from input and both cache counters', () => {
+    expect(calculateGatewayContextPercent({
+      input: 1,
+      output: 90_000,
+      cacheRead: 438_400,
+      cacheWrite: 307,
+      promptTokens: 438_708,
+    }, 1_000_000)).toBe(44);
+    expect(calculateGatewayContextPercent({ input: 0, output: 12 }, 200_000)).toBe(0);
+    expect(calculateGatewayContextPercent({ input: 300_000 }, 200_000)).toBe(100);
+    expect(calculateGatewayContextPercent({ output: 12 }, 200_000)).toBeUndefined();
+  });
+
+  test('aggregates turn counters while using the largest single-call prompt for ctx', () => {
+    const usage = aggregateGatewayUsage([
+      {
+        input: 20_000,
+        output: 100,
+        cacheRead: 30_000,
+        cacheWrite: 500,
+        promptTokens: 50_500,
+        totalTokens: 50_100,
+      },
+      {
+        input: 25_000,
+        output: 200,
+        cacheRead: 5_000,
+        cacheWrite: 100,
+        promptTokens: 30_100,
+      },
+    ]);
+
+    expect(usage).toEqual({
+      input: 45_000,
+      output: 300,
+      cacheRead: 35_000,
+      cacheWrite: 600,
+      promptTokens: 50_500,
+    });
+    expect(calculateGatewayContextPercent(usage, 100_000)).toBe(51);
+  });
+
+  test('merges message and top-level final usage without losing a breakdown', () => {
+    expect(mergeGatewayUsageSnapshots(
+      { totalTokens: 10_500 },
+      { input: 8_000, output: 500, cacheRead: 2_000, promptTokens: 10_000 },
+    )).toEqual({
+      input: 8_000,
+      output: 500,
+      cacheRead: 2_000,
+      totalTokens: 10_500,
+      promptTokens: 10_000,
+    });
+
+    expect(mergeGatewayUsageSnapshots(
+      { input: 8_000, promptTokens: 8_000 },
+      { output: 500, cacheWrite: 300, promptTokens: 300 },
+    )).toEqual({
+      input: 8_000,
+      output: 500,
+      cacheWrite: 300,
+      promptTokens: 8_300,
+    });
+  });
+
+  test('attaches tool-loop usage only to the final visible assistant in a turn', () => {
+    const entries = extractGatewayHistoryEntriesWithTurnUsage([
+      { role: 'user', content: 'Inspect the workspace' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'read', input: {} }],
+        model: 'anthropic/claude-sonnet-4',
+        usage: { input: 20_000, output: 100, cacheRead: 30_000, cacheWrite: 500 },
+      },
+      { role: 'tool', content: 'file contents' },
+      {
+        role: 'assistant',
+        content: 'Final answer',
+        model: 'gateway-injected',
+        usage: { input: 25_000, output: 200, cacheRead: 5_000, cacheWrite: 100 },
+      },
+    ]);
+
+    expect(entries).toEqual([
+      { role: 'user', text: 'Inspect the workspace' },
+      {
+        role: 'assistant',
+        text: 'Final answer',
+        usage: {
+          input: 45_000,
+          output: 300,
+          cacheRead: 35_000,
+          cacheWrite: 600,
+          promptTokens: 50_500,
+        },
+        model: 'anthropic/claude-sonnet-4',
+      },
+    ]);
+  });
+
+  test('attaches the aggregate only to the final visible assistant', () => {
+    const entries = extractGatewayHistoryEntriesWithTurnUsage([
+      { role: 'user', content: 'Work' },
+      { role: 'assistant', content: 'First segment', usage: { input: 10, output: 1 } },
+      { role: 'assistant', content: 'Final segment', usage: { input: 20, output: 2 } },
+    ]);
+
+    expect(entries[1]?.usage).toBeUndefined();
+    expect(entries[2]?.usage).toEqual({ input: 30, output: 3, promptTokens: 20 });
+  });
+
+  test('withholds a partial aggregate until the final visible call publishes usage', () => {
+    const entries = extractGatewayHistoryEntriesWithTurnUsage([
+      { role: 'user', content: 'Work' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'read', input: {} }],
+        usage: { input: 20_000, output: 100 },
+      },
+      { role: 'tool', content: 'file contents' },
+      { role: 'assistant', content: 'Final segment', model: 'anthropic/claude-sonnet-4' },
+    ]);
+
+    expect(entries).toEqual([
+      { role: 'user', text: 'Work' },
+      {
+        role: 'assistant',
+        text: 'Final segment',
+        model: 'anthropic/claude-sonnet-4',
+      },
+    ]);
+  });
+
+  test('partially aggregates a bounded turn even when its user boundary is truncated', () => {
+    const entries = extractGatewayHistoryEntriesWithTurnUsage([
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'read', input: {} }],
+        usage: { input: 10_000, output: 50 },
+      },
+      { role: 'tool', content: 'file contents' },
+      {
+        role: 'assistant',
+        content: 'Final answer',
+        usage: { input: 12_000, output: 75 },
+      },
+    ]);
+
+    expect(entries[0]?.usage).toMatchObject({
+      input: 22_000,
+      output: 125,
+      promptTokens: 12_000,
+    });
+  });
+
+  test('does not fold a hidden maintenance reply into the preceding visible answer', () => {
+    const entries = extractGatewayHistoryEntriesWithTurnUsage([
+      { role: 'user', content: 'Do the work' },
+      {
+        role: 'assistant',
+        content: 'Visible answer',
+        model: 'anthropic/claude-sonnet-4',
+        usage: { input: 20_000, output: 100, cacheRead: 30_000 },
+      },
+      {
+        role: 'assistant',
+        content: 'NO_REPLY',
+        model: 'different/maintenance-model',
+        usage: { input: 500_000, output: 10_000, cacheRead: 400_000 },
+      },
+    ]);
+
+    expect(entries).toEqual([
+      { role: 'user', text: 'Do the work' },
+      {
+        role: 'assistant',
+        text: 'Visible answer',
+        model: 'anthropic/claude-sonnet-4',
+        usage: {
+          input: 20_000,
+          output: 100,
+          cacheRead: 30_000,
+          promptTokens: 50_000,
+        },
+      },
+    ]);
+  });
+
+  test('rejects malformed usage values and normalizes valid counts', () => {
+    expect(normalizeGatewayUsage({ input: Number.NaN, output: '12' })).toBeUndefined();
+    expect(normalizeGatewayUsage({ input: -10, output: 12.9 })).toEqual({
+      input: 0,
+      output: 12,
+      promptTokens: 0,
+    });
+  });
+
+  test('history entries carry all normalized v2026.6.1 usage fields', () => {
+    expect(extractGatewayHistoryEntry({
+      role: 'assistant',
+      content: 'done',
+      model: 'anthropic/claude-sonnet-4',
+      usage: {
+        inputTokens: 12_000,
+        outputTokens: 300,
+        cache_read_input_tokens: 8_000,
+        cache_creation_input_tokens: 500,
+      },
+    })).toEqual({
+      role: 'assistant',
+      text: 'done',
+      usage: {
+        input: 12_000,
+        output: 300,
+        cacheRead: 8_000,
+        cacheWrite: 500,
+        promptTokens: 20_500,
+      },
+      model: 'anthropic/claude-sonnet-4',
+    });
+  });
+
+  test('filters the gateway-injected model placeholder from history entries', () => {
+    expect(extractGatewayHistoryEntry({
+      role: 'assistant',
+      content: 'done',
+      model: ' gateway-injected ',
+      usage: { input: 12, output: 3 },
+    })).toEqual({
+      role: 'assistant',
+      text: 'done',
+      usage: { input: 12, output: 3, promptTokens: 12 },
     });
   });
 

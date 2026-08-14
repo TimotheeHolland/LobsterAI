@@ -1957,9 +1957,10 @@ export class CoworkStore {
     sessionId: string,
     beforeMessageId: string,
     message: Omit<CoworkMessage, 'id' | 'timestamp'>,
+    timestamp?: number,
   ): CoworkMessage {
     const id = uuidv4();
-    const now = Date.now();
+    const now = timestamp ?? Date.now();
 
     // Get the target message's sequence
     const targetRow = this.db
@@ -1969,7 +1970,7 @@ export class CoworkStore {
 
     if (targetSequence === undefined) {
       // Fallback to normal append if the target message is not found
-      return this.addMessage(sessionId, message);
+      return this.addMessage(sessionId, message, timestamp);
     }
 
     this.db.transaction(() => {

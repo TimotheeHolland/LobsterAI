@@ -1,5 +1,9 @@
 const isValidDate = (date: Date): boolean => Number.isFinite(date.getTime());
 
+type ExactTokenLocale = 'en-US' | 'zh-CN';
+
+const exactTokenFormatters = new Map<ExactTokenLocale, Intl.NumberFormat>();
+
 export function formatMessageTime(timestamp: number): string {
   const date = new Date(timestamp);
   if (!isValidDate(date)) return '';
@@ -37,4 +41,16 @@ export function formatTokenCount(tokens: number): string {
     return `${(tokens / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
   }
   return String(tokens);
+}
+
+export function formatExactTokenCount(tokens: number, locale: ExactTokenLocale): string {
+  let formatter = exactTokenFormatters.get(locale);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(locale, {
+      maximumFractionDigits: 0,
+      useGrouping: true,
+    });
+    exactTokenFormatters.set(locale, formatter);
+  }
+  return formatter.format(tokens);
 }

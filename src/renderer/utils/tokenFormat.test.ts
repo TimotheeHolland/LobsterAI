@@ -1,6 +1,11 @@
 import { expect, test, vi } from 'vitest';
 
-import { formatMessageDateTime, formatMessageTime, formatTokenCount } from './tokenFormat';
+import {
+  formatExactTokenCount,
+  formatMessageDateTime,
+  formatMessageTime,
+  formatTokenCount,
+} from './tokenFormat';
 
 test('formatTokenCount: values below 1000 returned as-is', () => {
   expect(formatTokenCount(0)).toBe('0');
@@ -21,6 +26,11 @@ test('formatTokenCount: values in millions formatted as M', () => {
   expect(formatTokenCount(1000000)).toBe('1M');
   expect(formatTokenCount(1500000)).toBe('1.5M');
   expect(formatTokenCount(2000000)).toBe('2M');
+});
+
+test('formatExactTokenCount: preserves the full localized integer', () => {
+  expect(formatExactTokenCount(29_649, 'en-US')).toBe('29,649');
+  expect(formatExactTokenCount(1_500_001, 'en-US')).toBe('1,500,001');
 });
 
 test('formatMessageTime: today shows only time', () => {

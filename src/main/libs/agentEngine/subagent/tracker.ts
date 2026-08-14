@@ -3,9 +3,33 @@ import crypto from 'node:crypto';
 import type { SubagentMessageStore } from '../../../subagentMessageStore';
 import type { SubagentRunStore, SubagentRunWithParent } from '../../../subagentRunStore';
 import {
+  extractGatewayAssistantTurnUsages,
+  normalizeGatewayModelIdentity,
+  resolveGatewaySessionInfoContext,
+} from '../../openclawHistory';
+import {
+  buildSubagentNonUserMetadataMatches,
+  findSubagentLogicalTurnAlignment,
+  type SubagentChildHistoryEntry,
+} from './childHistorySync';
+import {
   parseSubagentGatewayHistoryMessages,
   type SubagentCoworkMessage,
 } from './historyParser';
+
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  Boolean(value && typeof value === 'object' && !Array.isArray(value))
+);
+
+const hasFiniteUsageMetadata = (metadata: SubagentCoworkMessage['metadata']): boolean => {
+  const usage = isRecord(metadata?.usage) ? metadata.usage : undefined;
+  return Boolean(usage && [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+  ].some(value => typeof value === 'number' && Number.isFinite(value)));
+};
 
 const resolveSpawnDisplayLabel = (...sources: Array<Record<string, unknown> | null | undefined>): string | null => {
   for (const source of sources) {
@@ -51,6 +75,9 @@ const GATEWAY_SESSION_DELETE_CONCURRENCY = 2;
 const GATEWAY_SESSION_DELETE_MAX_ATTEMPTS = 3;
 const GATEWAY_SESSION_DELETE_BASE_DELAY_MS = 5_000;
 const GATEWAY_SESSION_DELETE_MAX_DELAY_MS = 20_000;
+const SUBAGENT_METADATA_BACKFILL_TRACKING_LIMIT = 400;
+const SUBAGENT_USAGE_METADATA_BACKFILL_VERSION = 1;
+const SUBAGENT_USAGE_METADATA_BACKFILL_VERSION_KEY = 'openclawUsageMetadataBackfillVersion';
 
 /**
  * Encapsulates all subagent (child session) tracking logic:
@@ -75,6 +102,11 @@ export class SubagentTracker {
   private readonly gatewaySessionDeleteQueue = new Map<string, GatewaySessionDeleteTask>();
   private readonly gatewaySessionDeleteInFlight = new Set<string>();
   private readonly gatewaySessionDeleteRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly metadataBackfillAttempted = new Set<string>();
+  private readonly historyFetchByRunId = new Map<string, {
+    token: symbol;
+    parentSessionId: string;
+  }>();
   /** Pending spawn info stored at tool start, used for DB insertion when result arrives */
   private readonly pendingSpawnInfo = new Map<string, {
     agentId: string;
@@ -104,6 +136,7 @@ export class SubagentTracker {
     args: Record<string, unknown>,
     sessionId: string,
   ): void {
+    this.historyFetchByRunId.delete(toolCallId);
     this.deletedSubagentRunIds.delete(toolCallId);
     const agentId = typeof args?.agentId === 'string' && args.agentId
       ? args.agentId
@@ -248,17 +281,27 @@ export class SubagentTracker {
    */
   onSessionDeleted(parentSessionId?: string): void {
     if (!parentSessionId) {
+      for (const runId of this.historyFetchByRunId.keys()) {
+        this.deletedSubagentRunIds.add(runId);
+      }
+      this.historyFetchByRunId.clear();
       this.subagentSessionKeys.clear();
       this.subagentMessages.clear();
       this.subagentStatus.clear();
       this.subagentToolCallIdToAgentId.clear();
       this.agentIdToToolCallIds.clear();
       this.pendingSpawnInfo.clear();
+      this.metadataBackfillAttempted.clear();
       return;
     }
 
     if (typeof this.store.clearChildSessionReference === 'function') {
       this.store.clearChildSessionReference(parentSessionId);
+    }
+    for (const [runId, fetchState] of this.historyFetchByRunId) {
+      if (fetchState.parentSessionId !== parentSessionId) continue;
+      this.deletedSubagentRunIds.add(runId);
+      this.clearSubagentMemory(runId);
     }
     const runs = this.store.listSubagentRuns(parentSessionId);
     if (runs.length === 0) {
@@ -415,15 +458,17 @@ export class SubagentTracker {
     // 1. Try locally collected messages (only serve cache if subagent is done/error)
     const local = this.subagentMessages.get(runId);
     if (local && local.length > 0 && (resolvedStatus === 'done' || resolvedStatus === 'error')) {
-      return local;
+      return this.backfillPersistedMetadataIfNeeded(parentSessionId, key, runId, local);
     }
 
     // 2. Try persisted messages from local database
     const persisted = this.loadPersistedMessages(runId);
-    if (persisted) return persisted;
+    if (persisted) {
+      return this.backfillPersistedMetadataIfNeeded(parentSessionId, key, runId, persisted);
+    }
 
-    console.log('[SubagentTracker] getSubTaskHistory: fetching history for runId:', runId, 'key:', key);
-    return this.fetchSubagentHistory(key, runId);
+    console.debug('[SubagentTracker] getSubTaskHistory: fetching history for runId:', runId, 'key:', key);
+    return this.fetchSubagentHistory(key, runId, parentSessionId);
   }
 
   // ── Private helpers ────────────────────────────────────────────────────
@@ -544,6 +589,8 @@ export class SubagentTracker {
     const agentId = this.subagentToolCallIdToAgentId.get(runId);
     this.subagentSessionKeys.delete(runId);
     this.subagentMessages.delete(runId);
+    this.metadataBackfillAttempted.delete(runId);
+    this.historyFetchByRunId.delete(runId);
     this.subagentStatus.delete(runId);
     this.subagentToolCallIdToAgentId.delete(runId);
     this.pendingSpawnInfo.delete(runId);
@@ -723,41 +770,98 @@ export class SubagentTracker {
   private async fetchSubagentHistory(
     sessionKey: string,
     runId: string,
+    parentSessionId: string,
+    options: { metadataBackfillBase?: SubagentCoworkMessage[] } = {},
   ): Promise<SubagentCoworkMessage[]> {
+    if (this.deletedSubagentRunIds.has(runId)) return [];
     const client = this.getGatewayClient();
     if (!client) return [];
+    const fetchToken = Symbol(runId);
+    this.historyFetchByRunId.set(runId, { token: fetchToken, parentSessionId });
+    const isCurrentFetch = (): boolean => (
+      !this.deletedSubagentRunIds.has(runId)
+      && this.getGatewayClient() === client
+      && this.historyFetchByRunId.get(runId)?.token === fetchToken
+    );
     try {
-      const history = await client.request<{ messages?: unknown[] }>('chat.history', {
+      const history = await client.request<{ messages?: unknown[]; sessionInfo?: unknown }>('chat.history', {
         sessionKey,
         limit: 100,
       }, { timeoutMs: 10_000 });
+      if (!isCurrentFetch()) return [];
 
       if (!Array.isArray(history?.messages) || history.messages.length === 0) {
-        console.log('[SubagentTracker] fetchSubagentHistory: no messages returned for key:', sessionKey);
+        console.debug('[SubagentTracker] fetchSubagentHistory: no messages returned for key:', sessionKey);
         return [];
       }
 
-      console.log('[SubagentTracker] fetchSubagentHistory: got', history.messages.length, 'raw messages for key:', sessionKey);
+      console.debug('[SubagentTracker] fetchSubagentHistory: got', history.messages.length, 'raw messages for key:', sessionKey);
 
-      const messages = parseSubagentGatewayHistoryMessages(history.messages);
+      const latestTurn = extractGatewayAssistantTurnUsages(history.messages).at(-1);
+      const sessionContext = resolveGatewaySessionInfoContext(
+        latestTurn?.model,
+        latestTurn?.modelProvider,
+        history.sessionInfo,
+      );
+      const currentStatus = this.subagentStatus.get(runId)
+        || this.store.getRunStatus(runId);
+      const latestTurnActive = sessionContext.hasActiveExecution
+        || (!sessionContext.hasTerminalExecution && currentStatus === 'running');
+      let messages = parseSubagentGatewayHistoryMessages(history.messages, {
+        contextTokens: latestTurnActive
+          ? undefined
+          : sessionContext.contextTokens,
+        sessionModel: sessionContext.applies
+          ? normalizeGatewayModelIdentity(
+            sessionContext.model,
+            sessionContext.modelProvider,
+          )?.ref
+          : undefined,
+        latestTurnActive,
+      });
 
-      // Cache locally
-      this.subagentMessages.set(runId, messages);
+      if (options.metadataBackfillBase) {
+        const merged = this.mergePersistedUsageMetadata(
+          options.metadataBackfillBase,
+          messages,
+        );
+        if (!isCurrentFetch()) return [];
+        this.subagentMessages.set(runId, merged.messages);
+        if (!isCurrentFetch()) return [];
+        this.persistMetadataBackfill(runId, merged.updates);
+        return merged.messages;
+      }
 
       // Only persist to database if the subagent is confirmed done/error.
       // If still running, the history may be incomplete — persist later when
       // done is confirmed via announce/resume/read events.
-      const currentStatus = this.subagentStatus.get(runId)
-        || this.store.getRunStatus(runId);
-      if (currentStatus === 'done' || currentStatus === 'error') {
+      const shouldPersist = !latestTurnActive
+        && (currentStatus === 'done' || currentStatus === 'error');
+      if (shouldPersist) {
+        messages = this.markAuthoritativeUsageMetadataCurrent(messages);
+      }
+
+      // Cache locally after decorating terminal authoritative usage so the
+      // next read does not issue a redundant metadata-backfill RPC.
+      if (!isCurrentFetch()) return [];
+      this.subagentMessages.set(runId, messages);
+
+      if (shouldPersist) {
+        if (!isCurrentFetch()) return [];
         this.persistMessages(runId, messages);
       }
 
-      console.log('[SubagentTracker] fetchSubagentHistory: extracted', messages.length, 'display messages for runId:', runId);
+      console.debug('[SubagentTracker] fetchSubagentHistory: extracted', messages.length, 'display messages for runId:', runId);
       return messages;
     } catch (error) {
-      console.warn('[SubagentTracker] Failed to fetch subagent history:', error);
+      if (isCurrentFetch()) {
+        console.warn('[SubagentTracker] Failed to fetch subagent history:', error);
+      }
       return [];
+    } finally {
+      if (this.historyFetchByRunId.get(runId)?.token === fetchToken) {
+        this.historyFetchByRunId.delete(runId);
+      }
     }
   }
 
@@ -778,12 +882,98 @@ export class SubagentTracker {
       type: row.type as SubagentCoworkMessage['type'],
       content: row.content,
       timestamp: row.createdAt,
-      metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+      metadata: this.parsePersistedMetadata(runId, row.metadata),
     }));
 
     // Populate in-memory cache so subsequent reads skip the DB
     this.subagentMessages.set(runId, messages);
     return messages;
+  }
+
+  private parsePersistedMetadata(
+    runId: string,
+    rawMetadata: string | null,
+  ): SubagentCoworkMessage['metadata'] | undefined {
+    if (!rawMetadata) return undefined;
+    try {
+      const parsed = JSON.parse(rawMetadata);
+      return isRecord(parsed) ? parsed : undefined;
+    } catch (error) {
+      console.warn('[SubagentTracker] ignored malformed persisted message metadata for runId:', runId, error);
+      return undefined;
+    }
+  }
+
+  private needsUsageMetadataBackfill(messages: SubagentCoworkMessage[]): boolean {
+    return [...this.getFinalAssistantIndexes(messages)].some((index) => {
+      const message = messages[index];
+      return message.metadata?.[SUBAGENT_USAGE_METADATA_BACKFILL_VERSION_KEY]
+        !== SUBAGENT_USAGE_METADATA_BACKFILL_VERSION;
+    });
+  }
+
+  private getFinalAssistantIndexes(messages: SubagentCoworkMessage[]): Set<number> {
+    let lastAssistantIndex: number | undefined;
+    const targets = new Set<number>();
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index];
+      if (message.type === 'user') {
+        if (lastAssistantIndex != null) targets.add(lastAssistantIndex);
+        lastAssistantIndex = undefined;
+      } else if (message.type === 'assistant' && message.content.trim()) {
+        lastAssistantIndex = index;
+      }
+    }
+    if (lastAssistantIndex != null) targets.add(lastAssistantIndex);
+    return targets;
+  }
+
+  private markAuthoritativeUsageMetadataCurrent(
+    messages: SubagentCoworkMessage[],
+  ): SubagentCoworkMessage[] {
+    const targetIndexes = this.getFinalAssistantIndexes(messages);
+    return messages.map((message, index) => {
+      if (!targetIndexes.has(index)) return message;
+      if (!hasFiniteUsageMetadata(message.metadata)) return message;
+      return {
+        ...message,
+        metadata: {
+          ...(message.metadata ?? {}),
+          [SUBAGENT_USAGE_METADATA_BACKFILL_VERSION_KEY]: SUBAGENT_USAGE_METADATA_BACKFILL_VERSION,
+        },
+      };
+    });
+  }
+
+  private rememberMetadataBackfillAttempt(runId: string): void {
+    this.metadataBackfillAttempted.delete(runId);
+    this.metadataBackfillAttempted.add(runId);
+    while (this.metadataBackfillAttempted.size > SUBAGENT_METADATA_BACKFILL_TRACKING_LIMIT) {
+      const oldestRunId = this.metadataBackfillAttempted.values().next().value;
+      if (typeof oldestRunId !== 'string') break;
+      this.metadataBackfillAttempted.delete(oldestRunId);
+    }
+  }
+
+  private async backfillPersistedMetadataIfNeeded(
+    parentSessionId: string,
+    sessionKey: string,
+    runId: string,
+    fallbackMessages: SubagentCoworkMessage[],
+  ): Promise<SubagentCoworkMessage[]> {
+    if (
+      !this.needsUsageMetadataBackfill(fallbackMessages)
+      || this.metadataBackfillAttempted.has(runId)
+      || !this.getGatewayClient()
+    ) {
+      return fallbackMessages;
+    }
+
+    this.rememberMetadataBackfillAttempt(runId);
+    const refreshed = await this.fetchSubagentHistory(sessionKey, runId, parentSessionId, {
+      metadataBackfillBase: fallbackMessages,
+    });
+    return refreshed.length > 0 ? refreshed : fallbackMessages;
   }
 
   /**
@@ -807,6 +997,156 @@ export class SubagentTracker {
       console.log('[SubagentTracker] persisted', messages.length, 'messages for runId:', runId);
     } catch (error) {
       console.warn('[SubagentTracker] Failed to persist messages for runId:', runId, error);
+    }
+  }
+
+  private mergePersistedUsageMetadata(
+    persistedMessages: SubagentCoworkMessage[],
+    authoritativeMessages: SubagentCoworkMessage[],
+  ): {
+    messages: SubagentCoworkMessage[];
+    updates: Array<{ id: string; metadata: Record<string, unknown> }>;
+  } {
+    const messages = persistedMessages.map(message => ({
+      ...message,
+      ...(message.metadata ? { metadata: { ...message.metadata } } : {}),
+    }));
+    const updates: Array<{ id: string; metadata: Record<string, unknown> }> = [];
+    const localHistoryEntries: SubagentChildHistoryEntry[] = messages.map(message => ({
+      type: message.type,
+      content: message.content,
+      metadata: message.metadata,
+      timestamp: message.timestamp,
+    }));
+    const authoritativeHistoryEntries: SubagentChildHistoryEntry[] = authoritativeMessages.map(
+      message => ({
+        type: message.type,
+        content: message.content,
+        metadata: message.metadata,
+        timestamp: message.timestamp,
+      }),
+    );
+    const authoritativeTargetIndexes = this.getFinalAssistantIndexes(authoritativeMessages);
+    let alignment = findSubagentLogicalTurnAlignment(
+      localHistoryEntries,
+      authoritativeHistoryEntries,
+    );
+    // Very old persisted subagent transcripts can predate storing their user
+    // anchor. Retain a narrow compatibility path only when one final local
+    // assistant has an exact, unique authoritative match. Corrected text or
+    // repeated replies remain unbound because their logical turn is unknown.
+    if (
+      !alignment
+      && !localHistoryEntries.some(entry => entry.type === 'user')
+    ) {
+      const localTargetIndexes = [...this.getFinalAssistantIndexes(messages)];
+      if (localTargetIndexes.length === 1) {
+        const localTargetIndex = localTargetIndexes[0];
+        const localContent = messages[localTargetIndex].content.trim();
+        const exactAuthoritativeTargets = [...authoritativeTargetIndexes].filter((index) => (
+          authoritativeMessages[index].content.trim() === localContent
+        ));
+        if (localContent && exactAuthoritativeTargets.length === 1) {
+          alignment = {
+            localStartIndex: localTargetIndex,
+            historyStartIndex: exactAuthoritativeTargets[0],
+            overlapTurnCount: 0,
+          };
+        }
+      }
+    }
+    if (!alignment) return { messages, updates };
+
+    const localCoveredEntries = localHistoryEntries.slice(alignment.localStartIndex);
+    const authoritativeCoveredEntries = authoritativeHistoryEntries.slice(alignment.historyStartIndex);
+    const metadataMatches = buildSubagentNonUserMetadataMatches(
+      localCoveredEntries,
+      authoritativeCoveredEntries,
+    );
+    const localNonUsers = messages
+      .slice(alignment.localStartIndex)
+      .flatMap((message, relativeIndex) => message.type === 'user' ? [] : [{
+        message,
+        absoluteIndex: alignment.localStartIndex + relativeIndex,
+      }]);
+    const authoritativeNonUsers = authoritativeMessages
+      .slice(alignment.historyStartIndex)
+      .flatMap((message, relativeIndex) => message.type === 'user' ? [] : [{
+        message,
+        absoluteIndex: alignment.historyStartIndex + relativeIndex,
+      }]);
+
+    for (
+      let authoritativeNonUserIndex = authoritativeNonUsers.length - 1;
+      authoritativeNonUserIndex >= 0;
+      authoritativeNonUserIndex -= 1
+    ) {
+      const authoritativeItem = authoritativeNonUsers[authoritativeNonUserIndex];
+      const authoritative = authoritativeItem.message;
+      if (
+        authoritative.type !== 'assistant'
+        || !authoritativeTargetIndexes.has(authoritativeItem.absoluteIndex)
+      ) continue;
+      const matchingLocalNonUserIndex = metadataMatches.get(authoritativeNonUserIndex);
+      if (matchingLocalNonUserIndex == null) continue;
+      const localItem = localNonUsers[matchingLocalNonUserIndex];
+      const local = localItem?.message;
+      if (!local || local.type !== 'assistant') continue;
+
+      const localUsage = isRecord(local.metadata?.usage) ? local.metadata.usage : undefined;
+      const authoritativeUsage = isRecord(authoritative.metadata?.usage)
+        ? authoritative.metadata.usage
+        : undefined;
+      const hasAuthoritativeUsage = hasFiniteUsageMetadata(authoritative.metadata);
+      const authoritativeTurnIsActive = authoritative.metadata?.isStreaming === true
+        || authoritative.metadata?.isFinal === false;
+      const metadata: Record<string, unknown> = {
+        ...(local.metadata ?? {}),
+        isStreaming: authoritativeTurnIsActive,
+        isFinal: !authoritativeTurnIsActive,
+        ...(!authoritativeTurnIsActive && authoritativeUsage ? {
+          usage: {
+            ...(localUsage ?? {}),
+            ...authoritativeUsage,
+          },
+        } : {}),
+        ...(!authoritativeTurnIsActive
+          && typeof authoritative.metadata?.contextPercent === 'number'
+          ? { contextPercent: authoritative.metadata.contextPercent }
+          : {}),
+        ...(typeof authoritative.metadata?.model === 'string'
+          ? { model: authoritative.metadata.model }
+          : {}),
+        // A lagging transcript can expose the final text before its usage.
+        // Mark the durable upgrade complete only after authoritative counters
+        // arrive; the per-process attempt set prevents a polling loop today,
+        // while a later app launch can safely retry old rows.
+        ...(!authoritativeTurnIsActive && hasAuthoritativeUsage ? {
+          [SUBAGENT_USAGE_METADATA_BACKFILL_VERSION_KEY]: SUBAGENT_USAGE_METADATA_BACKFILL_VERSION,
+        } : {}),
+      };
+      if (authoritativeTurnIsActive) {
+        delete metadata.usage;
+        delete metadata.contextPercent;
+        delete metadata[SUBAGENT_USAGE_METADATA_BACKFILL_VERSION_KEY];
+      }
+      messages[localItem.absoluteIndex] = { ...local, metadata };
+      updates.push({ id: local.id, metadata });
+    }
+
+    return { messages, updates };
+  }
+
+  private persistMetadataBackfill(
+    runId: string,
+    updates: Array<{ id: string; metadata: Record<string, unknown> }>,
+  ): void {
+    if (!this.messageStore || updates.length === 0) return;
+    try {
+      this.messageStore.updateMessageMetadata(runId, updates);
+      console.debug('[SubagentTracker] refreshed persisted metadata for runId:', runId);
+    } catch (error) {
+      console.warn('[SubagentTracker] failed to refresh persisted metadata for runId:', runId, error);
     }
   }
 
