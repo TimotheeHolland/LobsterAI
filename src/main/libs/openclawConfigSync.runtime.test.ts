@@ -560,7 +560,10 @@ describe('OpenClawConfigSync runtime config output', () => {
       },
     ];
 
-    const { OpenClawConfigSync } = await import('./openclawConfigSync');
+    const {
+      OPENCLAW_DEFAULT_MODEL_TIMEOUT_SECONDS,
+      OpenClawConfigSync,
+    } = await import('./openclawConfigSync');
 
     const sync = new OpenClawConfigSync({
       engineManager: {
@@ -606,6 +609,7 @@ describe('OpenClawConfigSync runtime config output', () => {
     expect(config.models.providers.openai.api).toBe('openai-chatgpt-responses');
     expect(config.models.providers['openai-codex']).toBeUndefined();
     expect(config.models.providers.deepseek).toBeDefined();
+    expect(config.models.providers.deepseek.timeoutSeconds).toBe(OPENCLAW_DEFAULT_MODEL_TIMEOUT_SECONDS);
     expect(config.agents.defaults.models).toBeUndefined();
     expect(config.agents.defaults.workspace).toBe(path.join(stateDir, 'workspace-main'));
     expect(config.agents.defaults.cwd).toBe(path.resolve(tmpDir));
@@ -1873,7 +1877,10 @@ describe('OpenClawConfigSync runtime config output', () => {
 
   test('maps OpenAI OAuth mode to the ChatGPT Responses provider', async () => {
     const { AuthType, OpenClawApi, OpenClawProviderId, ProviderName } = await import('../../shared/providers');
-    const { buildProviderSelection } = await import('./openclawConfigSync');
+    const {
+      OPENCLAW_DEFAULT_MODEL_TIMEOUT_SECONDS,
+      buildProviderSelection,
+    } = await import('./openclawConfigSync');
 
     const selection = buildProviderSelection({
       apiKey: '',
@@ -1892,6 +1899,7 @@ describe('OpenClawConfigSync runtime config output', () => {
     expect(selection.providerConfig.baseUrl).toBe('https://chatgpt.com/backend-api/codex');
     expect(selection.providerConfig.api).toBe(OpenClawApi.OpenAIChatGPTResponses);
     expect(selection.providerConfig.auth).toBe(AuthType.OAuth);
+    expect(selection.providerConfig.timeoutSeconds).toBe(OPENCLAW_DEFAULT_MODEL_TIMEOUT_SECONDS);
     expect(selection.providerConfig).not.toHaveProperty('headers');
     expect(selection.providerConfig).not.toHaveProperty('apiKey');
   });

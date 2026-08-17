@@ -126,6 +126,7 @@ export function omitPluginIndexManagedKeys(plugins: unknown): Record<string, unk
  * Also used by the runtime adapter's client-side timeout watchdog.
  */
 export const OPENCLAW_AGENT_TIMEOUT_SECONDS = 3600;
+export const OPENCLAW_DEFAULT_MODEL_TIMEOUT_SECONDS = 900;
 export const OPENCLAW_LOBSTERAI_MODEL_TIMEOUT_SECONDS = 330;
 export const OPENCLAW_HEARTBEAT_EVERY_ENABLED = '1h';
 export const OPENCLAW_HEARTBEAT_EVERY_DISABLED = '0m';
@@ -1265,9 +1266,9 @@ export const buildProviderSelection = (options: {
       api,
       ...(apiKey ? { apiKey } : {}),
       auth,
-      ...(descriptor.providerId === OpenClawProviderId.LobsteraiServer
-        ? { timeoutSeconds: OPENCLAW_LOBSTERAI_MODEL_TIMEOUT_SECONDS }
-        : {}),
+      timeoutSeconds: descriptor.providerId === OpenClawProviderId.LobsteraiServer
+        ? OPENCLAW_LOBSTERAI_MODEL_TIMEOUT_SECONDS
+        : OPENCLAW_DEFAULT_MODEL_TIMEOUT_SECONDS,
       ...(request ? { request } : {}),
       models: [
         {
