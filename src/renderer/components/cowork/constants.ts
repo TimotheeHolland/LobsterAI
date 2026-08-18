@@ -9,10 +9,25 @@ export const CoworkUiEvent = {
   ShortcutToggleArtifacts: 'cowork:shortcut:toggle-artifacts',
   ShortcutSwitchAgent: 'cowork:shortcut:switch-agent',
   ShortcutShowCurrentAgentTasks: 'cowork:shortcut:show-current-agent-tasks',
+  ShortcutCollapseCurrentAgentTasks: 'cowork:shortcut:collapse-current-agent-tasks',
   ShortcutOpenAgentTaskSlot: 'cowork:shortcut:open-agent-task-slot',
 } as const;
 
 export type CoworkUiEvent = typeof CoworkUiEvent[keyof typeof CoworkUiEvent];
+
+export const CoworkTaskSearchRequestSource = {
+  SidebarHeader: 'sidebar_header',
+  WindowsTitleBar: 'windows_title_bar',
+  KeyboardShortcut: 'keyboard_shortcut',
+  UiEvent: 'ui_event',
+} as const;
+
+export type CoworkTaskSearchRequestSource =
+  typeof CoworkTaskSearchRequestSource[keyof typeof CoworkTaskSearchRequestSource];
+
+export interface CoworkTaskSearchRequestEventDetail {
+  source?: CoworkTaskSearchRequestSource;
+}
 
 export const CoworkShortcutDirection = {
   Previous: 'previous',
